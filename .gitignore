@@ -1,0 +1,29 @@
+# ESP-IDF build artifacts
+build/
+sdkconfig
+sdkconfig.old
+sdkconfig.ci
+managed_components/
+dependencies.lock
+
+# Leftover template files
+pytest_*.py
+
+# Captured CSI data (local)
+data/
+
+# Internal documentation (Spanish, local only)
+docs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db

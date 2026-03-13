@@ -1,0 +1,25 @@
+menu "CSI Capture Configuration"
+
+    config CSI_WIFI_SSID
+        string "WiFi SSID of the dedicated router"
+        default "YOUR_SSID"
+        help
+            SSID of the dedicated router for CSI capture.
+            The router should be configured for 2.4GHz only, 802.11n, 40MHz, fixed channel.
+
+    config CSI_WIFI_PASSWORD
+        string "WiFi Password"
+        default "YOUR_PASSWORD"
+        help
+            Password for the dedicated router's WiFi network.
+            Change this to your actual router password via menuconfig.
+
+    config CSI_WIFI_CHANNEL
+        int "WiFi Channel (fixed)"
+        default 6
+        range 1 13
+        help
+            Fixed channel number matching the router configuration.
+            Must match the router's channel setting exactly.
+
+endmenu
