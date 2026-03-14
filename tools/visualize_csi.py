@@ -2,14 +2,20 @@
 """
 Wi-Fi Vision 3D - CSI Real-Time Visualizer
 
-Connects to an ESP32-S3 via serial and displays live CSI data:
+Connects to an ESP32-S3 via serial or reads a CSV capture file and displays:
 - Subcarrier amplitude spectrum (bar chart)
 - Phase across subcarriers (unwrapped)
 - Amplitude heatmap over time (spectrogram)
+- Activity indicator (turbulence over time)
+- Wi-Fi signal strength (RSSI over time)
+
+Supports two file formats:
+- Raw serial: lines prefixed with CSI_DATA,...
+- CSV capture: files produced by capture_csi.py / record_session.py
 
 Usage:
     python visualize_csi.py --port COM3
-    python visualize_csi.py --file data/pos01_node01_20260313.csv
+    python visualize_csi.py --file data/sessions/.../raw/baseline_pos01_node01.csv
 """
 
 import argparse
@@ -74,12 +80,59 @@ def parse_line(line: str) -> tuple[np.ndarray, np.ndarray, int] | None:
         return None
 
 
+CSV_HEADER_FIELDS = 18
+
+def parse_csv_line(line: str) -> tuple[np.ndarray, np.ndarray, int] | None:
+    """Parse a CSV capture line (from capture_csi.py / record_session.py).
+
+    CSV format: timestamp_us,mac,rssi,...,first_word_invalid,<csi_data>
+    where <csi_data> is space-separated int8 I/Q pairs in a single field.
+    """
+    parts = line.strip().split(",")
+    if len(parts) < CSV_HEADER_FIELDS + 1:
+        return None
+
+    try:
+        rssi = int(parts[2])
+        csi_field = ",".join(parts[CSV_HEADER_FIELDS:]).strip().strip('"')
+        iq_tokens = csi_field.split()
+        if len(iq_tokens) < 4:
+            return None
+
+        amplitudes, phases = parse_csi_complex(iq_tokens)
+        return amplitudes, phases, rssi
+    except (ValueError, IndexError):
+        return None
+
+
+def detect_file_format(filepath: str) -> str:
+    """Peek at a file to determine if it is raw serial or CSV capture format.
+
+    Returns 'csv' or 'raw'.
+    """
+    with open(filepath, "r", encoding="utf-8") as f:
+        for _ in range(30):
+            line = f.readline()
+            if not line:
+                break
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("timestamp_us") or line.startswith('"timestamp_us'):
+                return "csv"
+            if line.startswith(CSI_LINE_PREFIX):
+                return "raw"
+    return "raw"
+
+
 class CSIVisualizer:
     def __init__(self, source, is_file=False, baud=921600):
         self.source = source
         self.is_file = is_file
         self.baud = baud
         self.ser = None
+        self.csv_mode = False
+        self.csv_header_skipped = False
         self.debug_lines_shown = 0
         self.max_debug_lines = 10
         self.total_serial_lines = 0
@@ -88,11 +141,13 @@ class CSIVisualizer:
         self.amp_history = deque(maxlen=HISTORY_LENGTH)
         self.phase_history = deque(maxlen=HISTORY_LENGTH)
         self.rssi_history = deque(maxlen=HISTORY_LENGTH)
+        self.activity_history = deque(maxlen=HISTORY_LENGTH)
         self.frame_count = 0
         self.n_subcarriers = 0
 
-        self.fig, self.axes = plt.subplots(3, 1, figsize=(14, 9))
-        self.fig.suptitle("Wi-Fi Vision 3D - CSI Monitor", fontsize=14, fontweight="bold")
+        self.fig, self.axes = plt.subplots(5, 1, figsize=(14, 14))
+        self.fig.suptitle("Wi-Fi Vision 3D - CSI Monitor", fontsize=14,
+                          fontweight="bold", color="#e0e0e0")
         self.fig.set_facecolor("#1a1a2e")
 
         for ax in self.axes:
@@ -107,6 +162,8 @@ class CSIVisualizer:
         self.ax_amp = self.axes[0]
         self.ax_phase = self.axes[1]
         self.ax_spectrogram = self.axes[2]
+        self.ax_activity = self.axes[3]
+        self.ax_rssi = self.axes[4]
 
         self.ax_amp.set_title("Subcarrier Amplitude (current frame)")
         self.ax_amp.set_xlabel("Subcarrier Index")
@@ -120,19 +177,29 @@ class CSIVisualizer:
         self.ax_spectrogram.set_xlabel("Subcarrier Index")
         self.ax_spectrogram.set_ylabel("Time (frames)")
 
-        self.amp_bars = None
-        self.phase_line = None
-        self.spectrogram_img = None
+        self.ax_activity.set_title("Indicador de Actividad (turbulencia)")
+        self.ax_activity.set_xlabel("Frame")
+        self.ax_activity.set_ylabel("CV (std/mean)")
+
+        self.ax_rssi.set_title("Senal Wi-Fi (RSSI)")
+        self.ax_rssi.set_xlabel("Frame")
+        self.ax_rssi.set_ylabel("RSSI (dBm)")
 
         self.status_text = self.fig.text(
-            0.02, 0.01, "", fontsize=9, color="#00ff88",
+            0.02, 0.005, "", fontsize=9, color="#00ff88",
             fontfamily="monospace"
         )
 
-        plt.tight_layout(rect=[0, 0.03, 1, 0.96])
+        plt.tight_layout(rect=[0, 0.025, 1, 0.965])
 
     def open_source(self):
         if self.is_file:
+            fmt = detect_file_format(self.source)
+            self.csv_mode = (fmt == "csv")
+            if self.csv_mode:
+                print(f"Formato detectado: CSV captura ({self.source})")
+            else:
+                print(f"Formato detectado: raw serial ({self.source})")
             self.file_handle = open(self.source, "r", encoding="utf-8")
             return True
         else:
@@ -154,8 +221,15 @@ class CSIVisualizer:
                 if not line:
                     return None
                 line = line.strip()
-                if line.startswith(CSI_LINE_PREFIX):
+                if not line or line.startswith("#"):
+                    continue
+                if self.csv_mode:
+                    if line.startswith("timestamp_us") or line.startswith('"timestamp_us'):
+                        continue
                     return line
+                else:
+                    if line.startswith(CSI_LINE_PREFIX):
+                        return line
         else:
             try:
                 raw = self.ser.readline()
@@ -173,6 +247,12 @@ class CSIVisualizer:
                 pass
         return None
 
+    def _parse(self, line: str):
+        """Route to the correct parser based on file format."""
+        if self.csv_mode:
+            return parse_csv_line(line)
+        return parse_line(line)
+
     def update(self, frame_num):
         lines_read = 0
         max_lines = 5 if not self.is_file else 20
@@ -182,16 +262,20 @@ class CSIVisualizer:
             if line is None:
                 break
 
-            result = parse_line(line)
+            result = self._parse(line)
             if result is None:
                 continue
 
             amplitudes, phases, rssi = result
             self.n_subcarriers = len(amplitudes)
 
+            mean_amp = np.mean(amplitudes)
+            cv = np.std(amplitudes) / mean_amp if mean_amp > 0 else 0.0
+
             self.amp_history.append(amplitudes)
             self.phase_history.append(np.unwrap(phases))
             self.rssi_history.append(rssi)
+            self.activity_history.append(cv)
             self.frame_count += 1
             lines_read += 1
 
@@ -205,6 +289,7 @@ class CSIVisualizer:
         n = len(current_amp)
         x = np.arange(n)
 
+        # Panel 1: Amplitude spectrum
         self.ax_amp.cla()
         self.ax_amp.set_facecolor("#16213e")
         self.ax_amp.set_title("Subcarrier Amplitude (current frame)", color="#e0e0e0")
@@ -215,6 +300,7 @@ class CSIVisualizer:
         self.ax_amp.set_xlabel("Subcarrier Index", color="#d0d0d0")
         self.ax_amp.set_ylabel("Amplitude", color="#d0d0d0")
 
+        # Panel 2: Phase
         self.ax_phase.cla()
         self.ax_phase.set_facecolor("#16213e")
         self.ax_phase.set_title("Subcarrier Phase (unwrapped)", color="#e0e0e0")
@@ -223,6 +309,7 @@ class CSIVisualizer:
         self.ax_phase.set_xlabel("Subcarrier Index", color="#d0d0d0")
         self.ax_phase.set_ylabel("Phase (rad)", color="#d0d0d0")
 
+        # Panel 3: Spectrogram
         if len(self.amp_history) > 1:
             max_sc = max(len(a) for a in self.amp_history)
             spectrogram = np.zeros((len(self.amp_history), max_sc))
@@ -238,6 +325,45 @@ class CSIVisualizer:
             )
             self.ax_spectrogram.set_xlabel("Subcarrier Index", color="#d0d0d0")
             self.ax_spectrogram.set_ylabel("Time (frames)", color="#d0d0d0")
+
+        # Panel 4: Activity indicator (CV turbulence)
+        if len(self.activity_history) > 1:
+            act = list(self.activity_history)
+            t = np.arange(len(act))
+            self.ax_activity.cla()
+            self.ax_activity.set_facecolor("#16213e")
+            self.ax_activity.set_title("Indicador de Actividad (turbulencia)", color="#e0e0e0")
+            self.ax_activity.fill_between(t, act, alpha=0.35, color="#4ade80")
+            self.ax_activity.plot(t, act, color="#4ade80", linewidth=1.2)
+            self.ax_activity.set_xlim(0, max(len(act) - 1, 1))
+            self.ax_activity.set_ylim(0, max(max(act) * 1.2, 0.1))
+            self.ax_activity.set_xlabel("Frame", color="#d0d0d0")
+            self.ax_activity.set_ylabel("CV (std/mean)", color="#d0d0d0")
+            self.ax_activity.axhline(
+                y=np.mean(act), color="#fbbf24", linewidth=0.8,
+                linestyle="--", alpha=0.7
+            )
+
+        # Panel 5: RSSI over time
+        if len(self.rssi_history) > 1:
+            rssi_vals = list(self.rssi_history)
+            t = np.arange(len(rssi_vals))
+            self.ax_rssi.cla()
+            self.ax_rssi.set_facecolor("#16213e")
+            self.ax_rssi.set_title("Senal Wi-Fi (RSSI)", color="#e0e0e0")
+            self.ax_rssi.plot(t, rssi_vals, color="#38bdf8", linewidth=1.2)
+            self.ax_rssi.fill_between(t, rssi_vals, alpha=0.2, color="#38bdf8")
+            self.ax_rssi.set_xlim(0, max(len(rssi_vals) - 1, 1))
+            r_min = min(rssi_vals)
+            r_max = max(rssi_vals)
+            margin = max((r_max - r_min) * 0.2, 2)
+            self.ax_rssi.set_ylim(r_min - margin, r_max + margin)
+            self.ax_rssi.set_xlabel("Frame", color="#d0d0d0")
+            self.ax_rssi.set_ylabel("RSSI (dBm)", color="#d0d0d0")
+            self.ax_rssi.axhline(
+                y=np.mean(rssi_vals), color="#fbbf24", linewidth=0.8,
+                linestyle="--", alpha=0.7
+            )
 
         avg_rssi = np.mean(list(self.rssi_history)[-50:]) if self.rssi_history else 0
         elapsed = time.time() - self.start_time if hasattr(self, "start_time") else 0.001
