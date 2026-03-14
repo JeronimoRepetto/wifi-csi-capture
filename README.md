@@ -2,6 +2,12 @@
 
 Firmware and tools for extracting Wi-Fi Channel State Information (CSI) from ESP32-S3 microcontrollers. Captures amplitude and phase data across 114 OFDM subcarriers (HT40, 40MHz) at **100 Hz** and exports it as structured CSV for downstream analysis, digital twin calibration, or AI training pipelines.
 
+<p align="center">
+  <img src="images/csi_monitor.png" alt="Wi-Fi Vision 3D - CSI Monitor" width="700">
+</p>
+
+<p align="center"><em>Real-time CSI visualizer showing subcarrier amplitude, unwrapped phase, and amplitude spectrogram at ~47 Hz</em></p>
+
 ## What is CSI?
 
 Modern Wi-Fi (802.11n/ac/ax) uses Orthogonal Frequency-Division Multiplexing (OFDM), splitting the channel into many narrow subcarriers. CSI exposes the **amplitude and phase** of each subcarrier at the physical layer. When a person moves through the RF field, their body (mostly water) reflects and absorbs microwaves, altering the multipath propagation pattern. These perturbations are encoded in the CSI matrix and can be used to detect presence, movement, and even body pose -- all without cameras.
