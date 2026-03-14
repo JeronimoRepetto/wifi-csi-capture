@@ -126,10 +126,13 @@ def detect_file_format(filepath: str) -> str:
 
 
 class CSIVisualizer:
-    def __init__(self, source, is_file=False, baud=921600):
+    def __init__(self, source, is_file=False, baud=921600, save_fig=None,
+                 save_after_frames=80):
         self.source = source
         self.is_file = is_file
         self.baud = baud
+        self.save_fig = save_fig
+        self.save_after_frames = save_after_frames
         self.ser = None
         self.csv_mode = False
         self.csv_header_skipped = False
@@ -396,17 +399,38 @@ class CSIVisualizer:
 
         self.start_time = time.time()
 
-        interval = 50 if not self.is_file else 20
-        self.anim = animation.FuncAnimation(
-            self.fig, self.update, interval=interval, blit=False, cache_frame_data=False
-        )
-
-        plt.show()
+        if self.save_fig:
+            self._run_headless()
+        else:
+            self._run_interactive()
 
         if self.ser:
             self.ser.close()
         if hasattr(self, "file_handle"):
             self.file_handle.close()
+
+    def _run_headless(self):
+        """Render frames in a loop without GUI, then save the figure."""
+        frame = 0
+        while self.frame_count < self.save_after_frames:
+            self.update(frame)
+            frame += 1
+            if self.is_file and self.frame_count == 0 and frame > 50:
+                print("WARN: no frames parsed after 50 iterations, aborting.")
+                return
+        self.fig.savefig(self.save_fig, dpi=150,
+                         facecolor=self.fig.get_facecolor(),
+                         bbox_inches="tight", pad_inches=0.3)
+        print(f"Screenshot guardado: {self.save_fig} ({self.frame_count} frames)")
+        plt.close(self.fig)
+
+    def _run_interactive(self):
+        """Normal animation loop with GUI window."""
+        interval = 50 if not self.is_file else 20
+        self.anim = animation.FuncAnimation(
+            self.fig, self.update, interval=interval, blit=False, cache_frame_data=False
+        )
+        plt.show()
 
 
 def main():
@@ -418,15 +442,23 @@ def main():
     group.add_argument("--file", help="CSV file for offline visualization")
     parser.add_argument("--baud", type=int, default=921600,
                         help="Serial baud rate (default: 921600)")
+    parser.add_argument("--save-fig", metavar="PATH",
+                        help="Save screenshot to PNG after ~80 frames and exit")
+    parser.add_argument("--save-after", type=int, default=80,
+                        help="Number of frames to render before saving (default: 80)")
     args = parser.parse_args()
 
     if args.port:
-        viz = CSIVisualizer(args.port, is_file=False, baud=args.baud)
+        viz = CSIVisualizer(args.port, is_file=False, baud=args.baud,
+                            save_fig=args.save_fig,
+                            save_after_frames=args.save_after)
     else:
         if not Path(args.file).exists():
             print(f"ERROR: File not found: {args.file}")
             sys.exit(1)
-        viz = CSIVisualizer(args.file, is_file=True)
+        viz = CSIVisualizer(args.file, is_file=True,
+                            save_fig=args.save_fig,
+                            save_after_frames=args.save_after)
 
     viz.run()
 

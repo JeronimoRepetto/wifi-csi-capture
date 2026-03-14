@@ -3,10 +3,10 @@
 Firmware and tools for extracting Wi-Fi Channel State Information (CSI) from ESP32-S3 microcontrollers. Captures amplitude and phase data across 114 OFDM subcarriers (HT40, 40MHz) at **100 Hz** and exports it as structured CSV for downstream analysis, digital twin calibration, or AI training pipelines.
 
 <p align="center">
-  <img src="images/csi_monitor.png" alt="Wi-Fi Vision 3D - CSI Monitor" width="700">
+  <img src="images/csi_monitor_5panels.png" alt="Wi-Fi Vision 3D - CSI Monitor (5 panels)" width="700">
 </p>
 
-<p align="center"><em>Real-time CSI visualizer showing subcarrier amplitude, unwrapped phase, and amplitude spectrogram at ~47 Hz</em></p>
+<p align="center"><em>Real-time CSI monitor: subcarrier amplitude, phase, spectrogram, activity indicator, and RSSI</em></p>
 
 ## What is CSI?
 
@@ -79,7 +79,7 @@ Frames HT:         100%
 python tools/visualize_csi.py --port COM3
 ```
 
-This opens a live window with three panels: subcarrier amplitude, unwrapped phase, and amplitude spectrogram.
+This opens a live window with five panels: subcarrier amplitude, unwrapped phase, amplitude spectrogram, activity indicator (CV turbulence), and RSSI over time.
 
 ### 5. Record a session
 
@@ -121,7 +121,7 @@ Data is saved to the `data/` directory (gitignored).
 │   ├── requirements.txt            Python dependencies (pyserial, matplotlib, numpy)
 │   ├── record_session.py           Session recorder: auto-detect ports, capture, manifest
 │   ├── capture_csi.py              Serial capture to CSV (N nodes, threaded)
-│   ├── visualize_csi.py            Real-time amplitude, phase, spectrogram plots
+│   ├── visualize_csi.py            Real-time 5-panel CSI monitor (amp, phase, spectrogram, activity, RSSI)
 │   ├── diagnose_serial.py          Serial diagnostics (auto baud, CSI rate, sig_mode stats)
 │   ├── measurement_protocol.py     4-round sequential capture across 8 positions
 │   ├── analyze_csi.py              Statistics, comparison, baseline export, spatial analysis
