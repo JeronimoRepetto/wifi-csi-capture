@@ -47,6 +47,8 @@ idf.py menuconfig
 #   → WiFi SSID:     your_router_ssid
 #   → WiFi Password:  your_router_password
 #   → WiFi Channel:   6  (must match router)
+#   → Filter CSI by target source MAC: y
+#   → Target source MAC: aa:bb:cc:dd:ee:ff (router/BSSID)
 ```
 
 ### 2. Build and flash
@@ -83,7 +85,7 @@ This opens a live window with three panels: subcarrier amplitude, unwrapped phas
 
 ```bash
 # Record 5-min baseline with 2 ESP32 (round 1 = positions 1,2, auto-detects ports)
-python tools/record_session.py --scenario baseline_empty --duration 300 --round 1
+python tools/record_session.py --scenario baseline_empty --duration 300 --round 1 --expected-mac aa:bb:cc:dd:ee:ff
 
 # Record person walking for 2 min (round 1)
 python tools/record_session.py --scenario stairs_walk --duration 120 --round 1
@@ -96,6 +98,7 @@ python tools/record_session.py --scenario baseline_empty --duration 300
 ```
 
 Sessions are saved to `data/sessions/` with a JSON manifest for traceability.
+If `--expected-mac` is provided, the recorder reports warnings when CSVs include mixed or unexpected MAC sources.
 
 ### 5b. Capture data to CSV (low-level)
 
@@ -113,7 +116,7 @@ Data is saved to the `data/` directory (gitignored).
 ├── main/
 │   ├── CMakeLists.txt              Component dependencies
 │   ├── csi_capture_main.c          Firmware: WiFi + CSI + ICMP ping + Queue
-│   └── Kconfig.projbuild           Configurable SSID, password, channel
+│   └── Kconfig.projbuild           Configurable SSID/password/channel and target MAC filter
 ├── tools/
 │   ├── requirements.txt            Python dependencies (pyserial, matplotlib, numpy)
 │   ├── record_session.py           Session recorder: auto-detect ports, capture, manifest
@@ -149,7 +152,7 @@ All Wi-Fi settings are configurable via `idf.py menuconfig` (stored in `sdkconfi
 | `CONFIG_FREERTOS_HZ` | `1000` | 1ms tick resolution for precise ping timing |
 | `CONFIG_LOG_DEFAULT_LEVEL` | `3` (INFO) | Show status reports during capture |
 
-The firmware also applies at runtime: `WIFI_PS_NONE` (radio always on), promiscuous mode (all frames), and `uart_set_baudrate(921600)` to override any sdkconfig defaults.
+The firmware also applies at runtime: `WIFI_PS_NONE` (radio always on), promiscuous mode, target-MAC filtering (if enabled), and `uart_set_baudrate(921600)` to override any sdkconfig defaults.
 
 ## Performance
 

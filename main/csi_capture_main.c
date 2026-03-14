@@ -14,6 +14,8 @@
 #include <stdio.h>
 #include <string.h>
 #include <inttypes.h>
+#include <stdlib.h>
+#include <stdbool.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/event_groups.h"
@@ -35,6 +37,8 @@
 #define WIFI_SSID         CONFIG_CSI_WIFI_SSID
 #define WIFI_PASSWORD     CONFIG_CSI_WIFI_PASSWORD
 #define WIFI_CHANNEL      CONFIG_CSI_WIFI_CHANNEL
+#define FILTER_TARGET_MAC CONFIG_CSI_FILTER_TARGET_MAC
+#define TARGET_MAC_STR    CONFIG_CSI_TARGET_MAC
 
 #define PING_INTERVAL_MS  10
 #define PING_TARGET_IP    "0.0.0.0"
@@ -55,8 +59,12 @@ static int s_retry_num = 0;
 #define MAX_RETRY 10
 
 static char s_gateway_ip[16] = {0};
-static volatile uint32_t s_csi_frame_count = 0;
+static volatile uint32_t s_csi_frame_count = 0;      /* accepted+enqueued attempts */
+static volatile uint32_t s_csi_total_count = 0;      /* all CSI callbacks */
 static volatile uint32_t s_csi_drop_count = 0;
+static volatile uint32_t s_csi_rejected_mac_count = 0;
+static bool s_target_mac_filter_enabled = false;
+static uint8_t s_target_mac[6] = {0};
 
 /* ── CSI Queue ─────────────────────────────────────────────────────────────── */
 
@@ -66,6 +74,46 @@ typedef struct {
 } csi_line_t;
 
 static QueueHandle_t s_csi_queue = NULL;
+
+/* ── MAC filter helpers ────────────────────────────────────────────────────── */
+
+static bool parse_mac_str(const char *mac_str, uint8_t out[6])
+{
+    if (!mac_str || !out) {
+        return false;
+    }
+
+    unsigned int b[6];
+    int n = sscanf(mac_str, "%2x:%2x:%2x:%2x:%2x:%2x",
+                   &b[0], &b[1], &b[2], &b[3], &b[4], &b[5]);
+    if (n != 6) {
+        return false;
+    }
+
+    for (int i = 0; i < 6; i++) {
+        if (b[i] > 0xFF) {
+            return false;
+        }
+        out[i] = (uint8_t)b[i];
+    }
+    return true;
+}
+
+static void init_mac_filter_from_config(void)
+{
+#if FILTER_TARGET_MAC
+    if (parse_mac_str(TARGET_MAC_STR, s_target_mac)) {
+        s_target_mac_filter_enabled = true;
+        ESP_LOGI(TAG, "Target MAC filter enabled -> %s", TARGET_MAC_STR);
+    } else {
+        s_target_mac_filter_enabled = false;
+        ESP_LOGE(TAG, "Invalid CSI_TARGET_MAC='%s'. Filter disabled.", TARGET_MAC_STR);
+    }
+#else
+    s_target_mac_filter_enabled = false;
+    ESP_LOGI(TAG, "Target MAC filter disabled");
+#endif
+}
 
 /* ── Wi-Fi Event Handler ───────────────────────────────────────────────────── */
 
@@ -97,6 +145,13 @@ static void event_handler(void *arg, esp_event_base_t event_base,
 static void IRAM_ATTR wifi_csi_rx_cb(void *ctx, wifi_csi_info_t *info)
 {
     if (!info || !info->buf || !s_csi_queue) {
+        return;
+    }
+
+    s_csi_total_count++;
+
+    if (s_target_mac_filter_enabled && memcmp(info->mac, s_target_mac, 6) != 0) {
+        s_csi_rejected_mac_count++;
         return;
     }
 
@@ -271,12 +326,17 @@ static void status_task(void *pvParameters)
     while (1) {
         vTaskDelay(pdMS_TO_TICKS(10000));
         uint32_t current = s_csi_frame_count;
+        uint32_t total = s_csi_total_count;
+        uint32_t rejected = s_csi_rejected_mac_count;
         uint32_t hz_10s = (current - last_count);
         last_count = current;
-        ESP_LOGI(TAG, "[STATUS] CSI: %lu total (%lu/10s = %.1f Hz) | Drops: %lu | Heap: %lu",
+        ESP_LOGI(TAG, "[STATUS] CSI accepted: %lu (%lu/10s = %.1f Hz) | "
+                 "Total callbacks: %lu | Rejected by MAC: %lu | Drops: %lu | Heap: %lu",
                  (unsigned long)current,
                  (unsigned long)hz_10s,
                  hz_10s / 10.0f,
+                 (unsigned long)total,
+                 (unsigned long)rejected,
                  (unsigned long)s_csi_drop_count,
                  (unsigned long)esp_get_minimum_free_heap_size());
     }
@@ -310,6 +370,7 @@ void app_main(void)
     }
     ESP_ERROR_CHECK(ret);
 
+    init_mac_filter_from_config();
     wifi_init_sta();
     csi_init();
 

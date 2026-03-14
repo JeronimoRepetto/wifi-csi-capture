@@ -32,6 +32,9 @@ from record_session import (  # noqa: E402
     build_session_name,
     ensure_unique_session_dir,
     resolve_runtime_inputs,
+    normalize_mac,
+    collect_mac_summary,
+    evaluate_mac_summary,
 )
 from analyze_csi import load_csi_file, export_baseline  # noqa: E402
 from spatial_filter import (  # noqa: E402
@@ -400,6 +403,36 @@ class TestRecordSessionHelpers:
         assert result["data_root"] == DEFAULT_DATA_ROOT
         assert result["dataset_label"] == "test"
 
+    def test_normalize_mac_valid(self):
+        assert normalize_mac("D8:47:32:2E:4C:F9") == "d8:47:32:2e:4c:f9"
+
+    def test_normalize_mac_invalid(self):
+        with pytest.raises(ValueError):
+            normalize_mac("d8:47:32:zz:4c:f9")
+
+    def test_collect_mac_summary_and_warnings(self, tmp_path):
+        raw_dir = tmp_path / "raw"
+        raw_dir.mkdir()
+        csv_path = raw_dir / "baseline_empty_pos01_node01_20260314.csv"
+        csv_path.write_text(
+            "# Wi-Fi Vision 3D - CSI Capture\n"
+            "timestamp_us,mac,rssi,rate,sig_mode,mcs,cwb,smoothing,not_sounding,"
+            "aggregation,stbc,fec,sgi,channel,secondary_channel,rx_seq,len,"
+            "first_word_invalid,csi_data\n"
+            "1000,d8:47:32:2e:4c:f9,-21,11,1,7,1,1,1,0,1,0,1,6,2,1,228,0,0 0 0 0\n"
+            "2000,d8:47:32:2e:4c:f9,-21,11,1,7,1,1,1,0,1,0,1,6,2,2,228,0,0 0 0 0\n"
+            "3000,20:6e:f1:99:a4:98,-45,11,1,7,1,1,1,0,1,0,1,6,2,3,228,0,0 0 0 0\n",
+            encoding="utf-8",
+        )
+
+        summary = collect_mac_summary(raw_dir)
+        counts = summary["by_node"]["1"]
+        assert counts["d8:47:32:2e:4c:f9"] == 2
+        assert counts["20:6e:f1:99:a4:98"] == 1
+
+        warns = evaluate_mac_summary(summary, expected_mac="d8:47:32:2e:4c:f9")
+        assert len(warns) >= 1
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Tests: analyze_csi.py
@@ -416,7 +449,7 @@ class TestLoadCsiFile:
         assert data["amplitude"].shape == (50, N_SUBCARRIERS)
         assert data["phase"].shape == (50, N_SUBCARRIERS)
         assert len(data["rssi"]) == 50
-        assert data["avg_hz"] > 0
+        assert data["avg_hz"] >= 45.0
         assert "Node ID" in data["metadata"]
 
     def test_load_empty_file(self, tmp_path):

@@ -24,6 +24,7 @@ Scenarios:
 """
 
 import argparse
+import csv
 import json
 import re
 import sys
@@ -47,6 +48,7 @@ ESP32_KNOWN_VIDS = {0x303A, 0x10C4, 0x1A86}
 
 DEFAULT_DATA_ROOT = Path("data")
 DEFAULT_DATASET_LABEL = "capture"
+MAC_RE = re.compile(r"^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$")
 
 
 # ── Input helpers ────────────────────────────────────────────────────────────
@@ -93,6 +95,14 @@ def parse_duration_seconds(raw_value: str | float | int) -> float:
     raise ValueError(f"Unsupported duration unit: {unit}")
 
 
+def normalize_mac(mac: str) -> str:
+    """Validate and normalize MAC strings to lowercase colon format."""
+    normalized = mac.strip().lower()
+    if not MAC_RE.fullmatch(normalized):
+        raise ValueError(f"Invalid MAC format: {mac}")
+    return normalized
+
+
 def build_session_name(scenario: str, dataset_label: str,
                        round_id: int | None,
                        now_fn=datetime.now) -> str:
@@ -116,6 +126,80 @@ def _prompt_with_default(prompt: str, default: str,
                          input_fn=input) -> str:
     answer = input_fn(f"{prompt} [{default}]: ").strip()
     return answer or default
+
+
+def collect_mac_summary(raw_dir: Path) -> dict:
+    """
+    Scan all CSVs in raw_dir and return per-file/per-node MAC counters.
+    Intended as a safety layer to detect mixed-emitter captures.
+    """
+    summary = {
+        "files": {},
+        "by_node": {},
+    }
+
+    for csv_path in sorted(raw_dir.glob("*.csv")):
+        counts: dict[str, int] = {}
+        node_id = None
+        for token in csv_path.stem.split("_"):
+            if token.startswith("node"):
+                try:
+                    node_id = int(token.replace("node", ""))
+                except ValueError:
+                    node_id = None
+                break
+
+        with open(csv_path, "r", encoding="utf-8") as f:
+            reader = csv.reader(f)
+            for row in reader:
+                if not row:
+                    continue
+                first = row[0].strip() if row[0] else ""
+                if first.startswith("#") or first == "timestamp_us":
+                    continue
+                if len(row) < 2:
+                    continue
+                mac = row[1].strip().lower()
+                if MAC_RE.fullmatch(mac):
+                    counts[mac] = counts.get(mac, 0) + 1
+
+        summary["files"][csv_path.name] = {
+            "node_id": node_id,
+            "mac_counts": dict(sorted(counts.items(), key=lambda x: x[1], reverse=True)),
+        }
+
+        if node_id is not None:
+            by_node = summary["by_node"].setdefault(str(node_id), {})
+            for mac, n in counts.items():
+                by_node[mac] = by_node.get(mac, 0) + n
+
+    for node_key, counts in summary["by_node"].items():
+        summary["by_node"][node_key] = dict(
+            sorted(counts.items(), key=lambda x: x[1], reverse=True)
+        )
+
+    return summary
+
+
+def evaluate_mac_summary(mac_summary: dict, expected_mac: str | None = None) -> list[str]:
+    """Generate warnings based on MAC contamination in captured CSVs."""
+    warnings: list[str] = []
+    for node_key, counts in mac_summary.get("by_node", {}).items():
+        if not counts:
+            continue
+        unique_macs = list(counts.keys())
+        dominant_mac = unique_macs[0]
+        if len(unique_macs) > 1:
+            warnings.append(
+                f"Node {node_key}: multiple source MACs detected {unique_macs}. "
+                f"Dominant={dominant_mac}"
+            )
+        if expected_mac and dominant_mac != expected_mac:
+            warnings.append(
+                f"Node {node_key}: dominant MAC {dominant_mac} does not match "
+                f"expected {expected_mac}"
+            )
+    return warnings
 
 
 def resolve_runtime_inputs(args: argparse.Namespace, input_fn=input):
@@ -276,7 +360,9 @@ def write_manifest(session_dir: Path, scenario: str, duration: float,
                    notes: str, dataset_label: str = "",
                    capture_mode: str = "cli_flags",
                    data_root_resolved: str = "",
-                   operator: str = ""):
+                   operator: str = "",
+                   expected_mac: str = "",
+                   mac_summary: dict | None = None):
     """
     Write session_manifest.json with full traceability metadata.
     """
@@ -290,8 +376,10 @@ def write_manifest(session_dir: Path, scenario: str, duration: float,
         "start_utc": datetime.now(tz=timezone.utc).isoformat(),
         "data_root_resolved": data_root_resolved,
         "operator": operator,
+        "expected_mac": expected_mac,
         "notes": notes,
         "nodes": [],
+        "mac_summary": mac_summary or {},
     }
 
     for res in results:
@@ -333,7 +421,10 @@ def main():
             "  python record_session.py --scenario baseline_empty --duration 300\n\n"
             "  # Save data to a different drive (e.g. D: with more space)\n"
             "  python record_session.py --scenario baseline_empty --duration 300 "
-            "--round 1 --data-root D:\\csi_data\n"
+            "--round 1 --data-root D:\\csi_data\n\n"
+            "  # Validate captured frames against expected router/BSSID MAC\n"
+            "  python record_session.py --scenario baseline_empty --duration 30s "
+            "--round 1 --expected-mac aa:bb:cc:dd:ee:ff\n"
         )
     )
     parser.add_argument("--scenario", default=None, choices=SCENARIOS,
@@ -361,6 +452,9 @@ def main():
                              "session names (sanitized)")
     parser.add_argument("--operator", default="",
                         help="Optional operator/user identifier for manifest")
+    parser.add_argument("--expected-mac", default=None,
+                        help="Expected source MAC in CSI (router/BSSID). "
+                             "Warns if captured files contain mixed or different MACs.")
     parser.add_argument("--notes", default="",
                         help="Free-text notes stored in the session manifest")
     args = parser.parse_args()
@@ -371,6 +465,7 @@ def main():
     data_root = runtime["data_root"]
     dataset_label = runtime["dataset_label"]
     capture_mode = runtime["capture_mode"]
+    expected_mac = normalize_mac(args.expected_mac) if args.expected_mac else None
 
     sessions_root = data_root / "sessions"
     try:
@@ -416,6 +511,8 @@ def main():
     print(f"  Label:     {dataset_label}")
     print(f"  Duration:  {duration_s}s ({duration_s/60:.1f} min)")
     print(f"  Mode:      {capture_mode}")
+    if expected_mac:
+        print(f"  MAC check: {expected_mac}")
     if args.round:
         print(f"  Round:     {args.round} (positions "
               f"{ROUND_POSITIONS.get(args.round, '?')})")
@@ -442,7 +539,21 @@ def main():
         port_node_map, raw_dir, duration_s, scenario=scenario
     )
 
-    # ── Write manifest ────────────────────────────────────────────────
+    manifest_path = session_dir / "session_manifest.json"
+    csv_files = sorted(raw_dir.glob("*.csv"))
+    if not manifest_path.exists():
+        print("ERROR: manifest file was not created.")
+    if not csv_files:
+        print("WARNING: No CSV files were generated in raw/.")
+
+    mac_summary = collect_mac_summary(raw_dir) if csv_files else {"files": {}, "by_node": {}}
+    mac_warnings = evaluate_mac_summary(mac_summary, expected_mac=expected_mac)
+    if mac_warnings:
+        print("\n[MAC validation warnings]")
+        for w in mac_warnings:
+            print(f"  - {w}")
+
+    # Write manifest including MAC summary and expected MAC context.
     manifest = write_manifest(
         session_dir, scenario, duration_s,
         args.round, port_node_map, results, args.notes,
@@ -450,14 +561,9 @@ def main():
         capture_mode=capture_mode,
         data_root_resolved=str(data_root.resolve()),
         operator=args.operator,
+        expected_mac=expected_mac or "",
+        mac_summary=mac_summary,
     )
-
-    manifest_path = session_dir / "session_manifest.json"
-    csv_files = sorted(raw_dir.glob("*.csv"))
-    if not manifest_path.exists():
-        print("ERROR: manifest file was not created.")
-    if not csv_files:
-        print("WARNING: No CSV files were generated in raw/.")
 
     # ── Final summary ─────────────────────────────────────────────────
     ok = sum(1 for r in results if r.success)
@@ -470,6 +576,8 @@ def main():
     print(f"  Session dir:  {session_dir}")
     print(f"  Raw CSVs:     {len(csv_files)}")
     print(f"  Manifest:     {manifest_path}")
+    if mac_warnings:
+        print(f"  MAC warnings: {len(mac_warnings)} (review manifest -> mac_summary)")
     print("=" * 64)
 
 

@@ -31,4 +31,20 @@ menu "CSI Capture Configuration"
             high-throughput CSI streaming. Must match the baud rate used
             by the PC capture/visualize scripts.
 
+    config CSI_FILTER_TARGET_MAC
+        bool "Filter CSI by target source MAC"
+        default n
+        help
+            If enabled, the firmware will only enqueue CSI frames whose
+            source MAC matches CSI_TARGET_MAC. This avoids mixed-emitter
+            captures that can contaminate the training dataset.
+
+    config CSI_TARGET_MAC
+        string "Target source MAC address (aa:bb:cc:dd:ee:ff)"
+        default ""
+        depends on CSI_FILTER_TARGET_MAC
+        help
+            Source MAC to accept in CSI callback. Use the router/BSSID MAC.
+            Example: d8:47:32:2e:4c:f9
+
 endmenu
