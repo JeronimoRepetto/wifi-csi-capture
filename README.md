@@ -47,6 +47,8 @@ idf.py menuconfig
 #   → WiFi SSID:     your_router_ssid
 #   → WiFi Password:  your_router_password
 #   → WiFi Channel:   6  (must match router)
+#   → Filter CSI by target source MAC: y
+#   → Target source MAC: aa:bb:cc:dd:ee:ff (router/BSSID)
 ```
 
 ### 2. Build and flash
@@ -79,7 +81,26 @@ python tools/visualize_csi.py --port COM3
 
 This opens a live window with three panels: subcarrier amplitude, unwrapped phase, and amplitude spectrogram.
 
-### 5. Capture data to CSV
+### 5. Record a session
+
+```bash
+# Record 5-min baseline with 2 ESP32 (round 1 = positions 1,2, auto-detects ports)
+python tools/record_session.py --scenario baseline_empty --duration 300 --round 1 --expected-mac aa:bb:cc:dd:ee:ff
+
+# Record person walking for 2 min (round 1)
+python tools/record_session.py --scenario stairs_walk --duration 120 --round 1
+
+# Record with explicit ports and positions
+python tools/record_session.py --scenario baseline_empty --duration 300 --ports COM3,COM5 --positions 5,6
+
+# Record all 8 nodes at once (auto-detect)
+python tools/record_session.py --scenario baseline_empty --duration 300
+```
+
+Sessions are saved to `data/sessions/` with a JSON manifest for traceability.
+If `--expected-mac` is provided, the recorder reports warnings when CSVs include mixed or unexpected MAC sources.
+
+### 5b. Capture data to CSV (low-level)
 
 ```bash
 python tools/capture_csi.py --port1 COM3 --port2 COM4 --position 1 --duration 300
@@ -95,14 +116,16 @@ Data is saved to the `data/` directory (gitignored).
 ├── main/
 │   ├── CMakeLists.txt              Component dependencies
 │   ├── csi_capture_main.c          Firmware: WiFi + CSI + ICMP ping + Queue
-│   └── Kconfig.projbuild           Configurable SSID, password, channel
+│   └── Kconfig.projbuild           Configurable SSID/password/channel and target MAC filter
 ├── tools/
 │   ├── requirements.txt            Python dependencies (pyserial, matplotlib, numpy)
-│   ├── capture_csi.py              Serial capture to CSV (1-2 nodes, threaded)
+│   ├── record_session.py           Session recorder: auto-detect ports, capture, manifest
+│   ├── capture_csi.py              Serial capture to CSV (N nodes, threaded)
 │   ├── visualize_csi.py            Real-time amplitude, phase, spectrogram plots
 │   ├── diagnose_serial.py          Serial diagnostics (auto baud, CSI rate, sig_mode stats)
 │   ├── measurement_protocol.py     4-round sequential capture across 8 positions
-│   ├── analyze_csi.py              Statistics, empty-vs-person comparison, baseline export
+│   ├── analyze_csi.py              Statistics, comparison, baseline export, spatial analysis
+│   ├── spatial_filter.py           Multi-node spatial consensus filter for zone isolation
 │   └── digital_twin_sionna.py      Scene config for NVIDIA Sionna ray tracing
 ```
 
@@ -129,7 +152,7 @@ All Wi-Fi settings are configurable via `idf.py menuconfig` (stored in `sdkconfi
 | `CONFIG_FREERTOS_HZ` | `1000` | 1ms tick resolution for precise ping timing |
 | `CONFIG_LOG_DEFAULT_LEVEL` | `3` (INFO) | Show status reports during capture |
 
-The firmware also applies at runtime: `WIFI_PS_NONE` (radio always on), promiscuous mode (all frames), and `uart_set_baudrate(921600)` to override any sdkconfig defaults.
+The firmware also applies at runtime: `WIFI_PS_NONE` (radio always on), promiscuous mode, target-MAC filtering (if enabled), and `uart_set_baudrate(921600)` to override any sdkconfig defaults.
 
 ## Performance
 

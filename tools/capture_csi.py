@@ -2,7 +2,7 @@
 """
 Wi-Fi Vision 3D - CSI Data Capture Tool
 
-Captures CSI data from 1 or 2 ESP32-S3 nodes simultaneously via serial USB.
+Captures CSI data from 1 or more ESP32-S3 nodes simultaneously via serial USB.
 Stores raw CSV data with position metadata for later analysis and digital twin
 calibration.
 
@@ -13,7 +13,6 @@ Usage:
 
 import argparse
 import csv
-import os
 import sys
 import time
 import threading
@@ -53,25 +52,59 @@ def parse_csi_line(line: str) -> dict | None:
     return result
 
 
-def capture_serial(port: str, node_id: int, position_id: int,
-                   output_dir: Path, duration: float, stop_event: threading.Event):
-    """Capture CSI data from one serial port."""
+class CaptureResult:
+    """Stores statistics from a single node capture thread."""
+
+    def __init__(self, node_id: int, port: str):
+        self.node_id = node_id
+        self.port = port
+        self.filepath: Path | None = None
+        self.frame_count = 0
+        self.error_count = 0
+        self.duration_actual = 0.0
+        self.avg_hz = 0.0
+        self.success = False
+
+    def to_dict(self) -> dict:
+        return {
+            "node_id": self.node_id,
+            "port": self.port,
+            "filepath": str(self.filepath) if self.filepath else None,
+            "frame_count": self.frame_count,
+            "error_count": self.error_count,
+            "duration_actual": round(self.duration_actual, 2),
+            "avg_hz": round(self.avg_hz, 2),
+            "success": self.success,
+        }
+
+
+def capture_node(port: str, node_id: int, position_id: int,
+                 output_dir: Path, duration: float,
+                 stop_event: threading.Event,
+                 scenario: str = "",
+                 baud_rate: int = BAUD_RATE) -> CaptureResult:
+    """
+    Capture CSI data from one serial port. Returns a CaptureResult with
+    statistics. This is the reusable core used by both capture_csi.py
+    and record_session.py.
+    """
+    result = CaptureResult(node_id, port)
 
     timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"pos{position_id:02d}_node{node_id:02d}_{timestamp_str}.csv"
+    prefix = f"{scenario}_" if scenario else ""
+    filename = f"{prefix}pos{position_id:02d}_node{node_id:02d}_{timestamp_str}.csv"
     filepath = output_dir / filename
+    result.filepath = filepath
 
-    frame_count = 0
-    error_count = 0
     start_time = time.time()
 
-    print(f"[Node {node_id}] Opening {port} at {BAUD_RATE} baud...")
+    print(f"[Node {node_id}] Opening {port} at {baud_rate} baud...")
 
     try:
-        ser = serial.Serial(port, BAUD_RATE, timeout=1)
+        ser = serial.Serial(port, baud_rate, timeout=1)
     except serial.SerialException as e:
         print(f"[Node {node_id}] ERROR: Cannot open {port}: {e}")
-        return
+        return result
 
     print(f"[Node {node_id}] Saving to: {filepath}")
 
@@ -83,11 +116,12 @@ def capture_serial(port: str, node_id: int, position_id: int,
             f"# Node ID: {node_id}",
             f"# Position ID: {position_id}",
             f"# Port: {port}",
+            f"# Scenario: {scenario or 'unspecified'}",
             f"# Start: {datetime.now().isoformat()}",
             f"# Duration: {duration}s",
         ]
-        for line in meta_header:
-            f.write(line + "\n")
+        for meta_line in meta_header:
+            f.write(meta_line + "\n")
 
         writer.writerow(CSI_HEADER + ["csi_data"])
 
@@ -104,95 +138,72 @@ def capture_serial(port: str, node_id: int, position_id: int,
                 line = raw.decode("utf-8", errors="replace").strip()
 
                 if not line.startswith(CSI_LINE_PREFIX):
-                    if line and not line.startswith("I ") and not line.startswith("W "):
-                        pass  # skip ESP log lines
                     continue
 
                 parsed = parse_csi_line(line)
                 if parsed is None:
-                    error_count += 1
+                    result.error_count += 1
                     continue
 
                 row = [parsed[k] for k in CSI_HEADER]
                 row.append(" ".join(parsed["csi_raw"]))
                 writer.writerow(row)
 
-                frame_count += 1
+                result.frame_count += 1
 
-                if frame_count % 100 == 0:
+                if result.frame_count % 100 == 0:
                     remaining = duration - elapsed
-                    hz = frame_count / elapsed if elapsed > 0 else 0
-                    print(f"[Node {node_id}] {frame_count} frames | "
+                    hz = result.frame_count / elapsed if elapsed > 0 else 0
+                    print(f"[Node {node_id}] {result.frame_count} frames | "
                           f"{hz:.1f} Hz | {remaining:.0f}s remaining | "
-                          f"{error_count} errors")
+                          f"{result.error_count} errors")
                     f.flush()
 
             except (serial.SerialException, UnicodeDecodeError) as e:
-                error_count += 1
-                if error_count % 50 == 0:
-                    print(f"[Node {node_id}] Serial error #{error_count}: {e}")
+                result.error_count += 1
+                if result.error_count % 50 == 0:
+                    print(f"[Node {node_id}] Serial error #{result.error_count}: {e}")
 
     ser.close()
-    total_time = time.time() - start_time
-    avg_hz = frame_count / total_time if total_time > 0 else 0
+    result.duration_actual = time.time() - start_time
+    result.avg_hz = (result.frame_count / result.duration_actual
+                     if result.duration_actual > 0 else 0)
+    result.success = result.frame_count > 0
 
     print(f"\n[Node {node_id}] Capture complete:")
-    print(f"  Frames: {frame_count}")
-    print(f"  Duration: {total_time:.1f}s")
-    print(f"  Average rate: {avg_hz:.1f} Hz")
-    print(f"  Errors: {error_count}")
+    print(f"  Frames: {result.frame_count}")
+    print(f"  Duration: {result.duration_actual:.1f}s")
+    print(f"  Average rate: {result.avg_hz:.1f} Hz")
+    print(f"  Errors: {result.error_count}")
     print(f"  File: {filepath}")
 
+    return result
 
-def main():
-    parser = argparse.ArgumentParser(
-        description="Wi-Fi Vision 3D - CSI Data Capture Tool"
-    )
-    parser.add_argument("--port1", required=True, help="Serial port for ESP32-S3 node 1 (e.g., COM3)")
-    parser.add_argument("--port2", default=None, help="Serial port for ESP32-S3 node 2 (e.g., COM4)")
-    parser.add_argument("--position", type=int, required=True, help="Position ID (1-8) for this capture round")
-    parser.add_argument("--duration", type=float, default=300, help="Capture duration in seconds (default: 300)")
-    parser.add_argument("--output", default="data", help="Output directory (default: data)")
-    args = parser.parse_args()
 
-    output_dir = Path(args.output)
+def launch_parallel_capture(port_node_map: list[tuple[str, int, int]],
+                            output_dir: Path, duration: float,
+                            scenario: str = "") -> list[CaptureResult]:
+    """
+    Launch capture threads for multiple nodes in parallel.
+    port_node_map is a list of (port, node_id, position_id) tuples.
+    Returns a list of CaptureResult objects once all threads finish.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
-
     stop_event = threading.Event()
+    results: list[CaptureResult] = []
+    threads: list[threading.Thread] = []
 
-    node1_id = (args.position - 1) * 2 + 1
-    node2_id = (args.position - 1) * 2 + 2
+    for port, node_id, position_id in port_node_map:
+        res = CaptureResult(node_id, port)
+        results.append(res)
 
-    print("=" * 60)
-    print("  Wi-Fi Vision 3D - CSI Capture")
-    print("=" * 60)
-    print(f"  Position: {args.position}")
-    print(f"  Node 1 (ID {node1_id}): {args.port1}")
-    if args.port2:
-        print(f"  Node 2 (ID {node2_id}): {args.port2}")
-    print(f"  Duration: {args.duration}s")
-    print(f"  Output: {output_dir}")
-    print("=" * 60)
-    print()
+        def _run(p=port, nid=node_id, pid=position_id, idx=len(results) - 1):
+            results[idx] = capture_node(
+                p, nid, pid, output_dir, duration, stop_event, scenario
+            )
 
-    threads = []
-
-    t1 = threading.Thread(
-        target=capture_serial,
-        args=(args.port1, node1_id, args.position, output_dir, args.duration, stop_event),
-        daemon=True
-    )
-    threads.append(t1)
-
-    if args.port2:
-        t2 = threading.Thread(
-            target=capture_serial,
-            args=(args.port2, node2_id, args.position, output_dir, args.duration, stop_event),
-            daemon=True
-        )
-        threads.append(t2)
-
-    print("Starting capture... Press Ctrl+C to stop early.\n")
+        t = threading.Thread(target=_run, daemon=True)
+        threads.append(t)
 
     for t in threads:
         t.start()
@@ -206,7 +217,46 @@ def main():
         for t in threads:
             t.join(timeout=3)
 
-    print("\nAll captures complete.")
+    return results
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Wi-Fi Vision 3D - CSI Data Capture Tool"
+    )
+    parser.add_argument("--port1", required=True, help="Serial port for ESP32-S3 node 1 (e.g., COM3)")
+    parser.add_argument("--port2", default=None, help="Serial port for ESP32-S3 node 2 (e.g., COM4)")
+    parser.add_argument("--position", type=int, required=True, help="Position ID (1-8) for this capture round")
+    parser.add_argument("--duration", type=float, default=300, help="Capture duration in seconds (default: 300)")
+    parser.add_argument("--output", default="data", help="Output directory (default: data)")
+    args = parser.parse_args()
+
+    node1_id = (args.position - 1) * 2 + 1
+    node2_id = (args.position - 1) * 2 + 2
+
+    print("=" * 60)
+    print("  Wi-Fi Vision 3D - CSI Capture")
+    print("=" * 60)
+    print(f"  Position: {args.position}")
+    print(f"  Node 1 (ID {node1_id}): {args.port1}")
+    if args.port2:
+        print(f"  Node 2 (ID {node2_id}): {args.port2}")
+    print(f"  Duration: {args.duration}s")
+    print(f"  Output: {args.output}")
+    print("=" * 60)
+    print()
+
+    port_map = [(args.port1, node1_id, args.position)]
+    if args.port2:
+        port_map.append((args.port2, node2_id, args.position))
+
+    print("Starting capture... Press Ctrl+C to stop early.\n")
+    results = launch_parallel_capture(
+        port_map, Path(args.output), args.duration
+    )
+
+    ok = sum(1 for r in results if r.success)
+    print(f"\nAll captures complete. {ok}/{len(results)} nodes successful.")
 
 
 if __name__ == "__main__":
