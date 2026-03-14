@@ -12,7 +12,7 @@ pytest_*.py
 # Captured CSI data (local)
 data/
 
-# Internal documentation (Spanish, local only)
+# Local docs and screenshots (do not publish)
 docs/
 
 # Python

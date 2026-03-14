@@ -1,27 +1,23 @@
 # wifi-csi-capture
 
-Firmware and tools for extracting Wi-Fi Channel State Information (CSI) from ESP32-S3 microcontrollers. Captures amplitude and phase data across 114 OFDM subcarriers (HT40, 40MHz) and exports it as structured CSV for downstream analysis, digital twin calibration, or AI training pipelines.
+Firmware and tools for extracting Wi-Fi Channel State Information (CSI) from ESP32-S3 microcontrollers. Captures amplitude and phase data across 114 OFDM subcarriers (HT40, 40MHz) at **100 Hz** and exports it as structured CSV for downstream analysis, digital twin calibration, or AI training pipelines.
 
 ## What is CSI?
 
 Modern Wi-Fi (802.11n/ac/ax) uses Orthogonal Frequency-Division Multiplexing (OFDM), splitting the channel into many narrow subcarriers. CSI exposes the **amplitude and phase** of each subcarrier at the physical layer. When a person moves through the RF field, their body (mostly water) reflects and absorbs microwaves, altering the multipath propagation pattern. These perturbations are encoded in the CSI matrix and can be used to detect presence, movement, and even body pose -- all without cameras.
 
-## What this project does
+## Architecture
 
 ```
   Dedicated Router          ESP32-S3 nodes             PC
   ┌──────────────┐       ┌────────────────┐       ┌──────────────┐
   │  2.4GHz Tx    │~WiFi~>│  CSI Extraction │~USB~>│  Capture &    │
-  │  802.11n HT40 │       │  114 subcarriers│       │  Validation   │
-  │  Fixed channel│       │  CSV over serial│       │  CSV export   │
+  │  802.11n HT40 │       │  114 subcarriers│       │  Visualization│
+  │  Fixed channel│<~ICMP~│  Queue → Serial │       │  CSV export   │
   └──────────────┘       └────────────────┘       └──────────────┘
 ```
 
-1. **Firmware** flashes onto ESP32-S3 devices, connects to a dedicated router, and streams raw CSI frames over USB serial.
-2. **Python tools** capture, visualize, analyze, and export the CSI data from one or more nodes simultaneously.
-3. **Sequential protocol** allows mapping an environment from 8 receiver positions using only 2 physical devices (4 rounds of capture).
-
-The exported data (CSV + JSON baseline) is designed to feed into a separate digital twin / AI training project.
+**Firmware design**: The CSI callback runs in the Wi-Fi task context and enqueues formatted lines into a FreeRTOS queue (zero-copy from callback perspective). A dedicated output task drains the queue to serial, preventing any I/O blocking in the Wi-Fi stack. An ICMP ping session generates continuous traffic to the router, which responds with Echo Reply frames that trigger CSI extraction at up to 100 Hz.
 
 ## Hardware requirements
 
@@ -31,50 +27,77 @@ The exported data (CSV + JSON baseline) is designed to feed into a separate digi
 
 ## Software requirements
 
-- [ESP-IDF v5.5.3](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/get-started/index.html)
+- [ESP-IDF v5.5+](https://docs.espressif.com/projects/esp-idf/en/v5.5.3/esp32s3/get-started/index.html)
 - Python 3.11+
 - Dependencies: `pip install -r tools/requirements.txt`
 
 ## Quick start
 
+### 1. Configure Wi-Fi credentials
+
 ```bash
-# 1. Set your router credentials
 idf.py menuconfig
-# -> CSI Capture Configuration -> WiFi SSID, Password, Channel
+# Navigate to: CSI Capture Configuration
+#   → WiFi SSID:     your_router_ssid
+#   → WiFi Password:  your_router_password
+#   → WiFi Channel:   6  (must match router)
+```
 
-# 2. Build
+### 2. Build and flash
+
+```bash
 idf.py build
+idf.py -p COM3 flash
+```
 
-# 3. Flash an ESP32-S3 and open serial monitor
-idf.py -p COM3 flash monitor
-# You should see CSI_DATA lines streaming
+### 3. Verify with serial diagnostic
 
-# 4. Install Python tools
+```bash
 pip install -r tools/requirements.txt
+python tools/diagnose_serial.py --port COM3 --duration 15
+```
 
-# 5. Visualize CSI in real time
+You should see output like:
+
+```
+Tasa CSI:          100.3 Hz
+Subportadoras:     114 (promedio)
+Frames HT:         100%
+```
+
+### 4. Real-time visualization
+
+```bash
 python tools/visualize_csi.py --port COM3
+```
 
-# 6. Capture data from 2 nodes for 5 minutes
+This opens a live window with three panels: subcarrier amplitude, unwrapped phase, and amplitude spectrogram.
+
+### 5. Capture data to CSV
+
+```bash
 python tools/capture_csi.py --port1 COM3 --port2 COM4 --position 1 --duration 300
 ```
+
+Data is saved to the `data/` directory (gitignored).
 
 ## Project structure
 
 ```
 ├── CMakeLists.txt                  ESP-IDF project root
-├── sdkconfig.defaults              Default config (CSI enabled, 921600 baud)
+├── sdkconfig.defaults              Default config (CSI, 921600 baud, PS off)
 ├── main/
 │   ├── CMakeLists.txt              Component dependencies
-│   ├── csi_capture_main.c          Firmware: WiFi STA + CSI extraction + UDP traffic gen
+│   ├── csi_capture_main.c          Firmware: WiFi + CSI + ICMP ping + Queue
 │   └── Kconfig.projbuild           Configurable SSID, password, channel
-└── tools/
-    ├── requirements.txt            Python dependencies (pyserial, matplotlib, numpy)
-    ├── capture_csi.py              Serial capture to CSV (1-2 nodes, threaded)
-    ├── visualize_csi.py            Real-time amplitude, phase, spectrogram plots
-    ├── measurement_protocol.py     4-round sequential capture across 8 positions
-    ├── analyze_csi.py              Statistics, empty-vs-person comparison, baseline export
-    └── digital_twin_sionna.py      Scene config for NVIDIA Sionna ray tracing
+├── tools/
+│   ├── requirements.txt            Python dependencies (pyserial, matplotlib, numpy)
+│   ├── capture_csi.py              Serial capture to CSV (1-2 nodes, threaded)
+│   ├── visualize_csi.py            Real-time amplitude, phase, spectrogram plots
+│   ├── diagnose_serial.py          Serial diagnostics (auto baud, CSI rate, sig_mode stats)
+│   ├── measurement_protocol.py     4-round sequential capture across 8 positions
+│   ├── analyze_csi.py              Statistics, empty-vs-person comparison, baseline export
+│   └── digital_twin_sionna.py      Scene config for NVIDIA Sionna ray tracing
 ```
 
 ## CSI output format
@@ -89,7 +112,7 @@ CSI_DATA,<timestamp_us>,<mac>,<rssi>,<rate>,<sig_mode>,<mcs>,<cwb>,<smoothing>,
 
 In HT40 mode: 114 subcarriers = 228 int8 values (imaginary, real pairs).
 
-## Configuration
+## Key configuration
 
 All Wi-Fi settings are configurable via `idf.py menuconfig` (stored in `sdkconfig`, which is gitignored). The file `sdkconfig.defaults` contains safe defaults:
 
@@ -98,6 +121,19 @@ All Wi-Fi settings are configurable via `idf.py menuconfig` (stored in `sdkconfi
 | `CONFIG_ESP_WIFI_CSI_ENABLED` | `y` | Enable CSI subsystem |
 | `CONFIG_ESP_CONSOLE_UART_BAUDRATE` | `921600` | High baud rate for CSI throughput |
 | `CONFIG_FREERTOS_HZ` | `1000` | 1ms tick resolution for precise ping timing |
+| `CONFIG_LOG_DEFAULT_LEVEL` | `3` (INFO) | Show status reports during capture |
+
+The firmware also applies at runtime: `WIFI_PS_NONE` (radio always on), promiscuous mode (all frames), and `uart_set_baudrate(921600)` to override any sdkconfig defaults.
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Internal CSI rate | **100 Hz** |
+| Serial throughput | **~50-93 Hz** (depending on line length) |
+| Subcarriers per frame | **114** (HT40) |
+| Queue drops | **0** (32-slot buffer) |
+| Free heap at runtime | **~212 KB** |
 
 ## License
 

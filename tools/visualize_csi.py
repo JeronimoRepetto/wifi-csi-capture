@@ -33,13 +33,13 @@ except ImportError:
 
 CSI_LINE_PREFIX = "CSI_DATA,"
 HISTORY_LENGTH = 200
-MAX_SUBCARRIERS = 114
+MAX_SUBCARRIERS = 128
 
 
 def parse_csi_complex(raw_values: list[str]) -> tuple[np.ndarray, np.ndarray]:
     """Convert raw int8 pairs (imag, real) to amplitude and phase arrays."""
     vals = [int(v) for v in raw_values if v.strip()]
-    n_pairs = len(vals) // 2
+    n_pairs = min(len(vals) // 2, MAX_SUBCARRIERS)
 
     amplitudes = np.zeros(n_pairs)
     phases = np.zeros(n_pairs)
@@ -75,10 +75,15 @@ def parse_line(line: str) -> tuple[np.ndarray, np.ndarray, int] | None:
 
 
 class CSIVisualizer:
-    def __init__(self, source, is_file=False):
+    def __init__(self, source, is_file=False, baud=921600):
         self.source = source
         self.is_file = is_file
+        self.baud = baud
         self.ser = None
+        self.debug_lines_shown = 0
+        self.max_debug_lines = 10
+        self.total_serial_lines = 0
+        self.unparsed_lines = 0
 
         self.amp_history = deque(maxlen=HISTORY_LENGTH)
         self.phase_history = deque(maxlen=HISTORY_LENGTH)
@@ -135,7 +140,8 @@ class CSIVisualizer:
                 print("ERROR: pyserial is required for live mode. pip install pyserial")
                 return False
             try:
-                self.ser = serial.Serial(self.source, 921600, timeout=0.1)
+                self.ser = serial.Serial(self.source, self.baud, timeout=0.1)
+                print(f"Conectado a {self.source} @ {self.baud} baud")
                 return True
             except serial.SerialException as e:
                 print(f"ERROR: Cannot open {self.source}: {e}")
@@ -154,7 +160,15 @@ class CSIVisualizer:
             try:
                 raw = self.ser.readline()
                 if raw:
-                    return raw.decode("utf-8", errors="replace").strip()
+                    line = raw.decode("utf-8", errors="replace").strip()
+                    if line:
+                        self.total_serial_lines += 1
+                        if not line.startswith(CSI_LINE_PREFIX):
+                            self.unparsed_lines += 1
+                            if self.debug_lines_shown < self.max_debug_lines:
+                                self.debug_lines_shown += 1
+                                print(f"  [DEBUG] {line[:150]}", file=sys.stderr)
+                    return line
             except (serial.SerialException, UnicodeDecodeError):
                 pass
         return None
@@ -226,14 +240,27 @@ class CSIVisualizer:
             self.ax_spectrogram.set_ylabel("Time (frames)", color="#d0d0d0")
 
         avg_rssi = np.mean(list(self.rssi_history)[-50:]) if self.rssi_history else 0
-        hz = self.frame_count / max(time.time() - self.start_time, 0.001) if hasattr(self, "start_time") else 0
+        elapsed = time.time() - self.start_time if hasattr(self, "start_time") else 0.001
+        hz = self.frame_count / max(elapsed, 0.001)
 
-        self.status_text.set_text(
+        status = (
             f"Frames: {self.frame_count}  |  "
             f"Subcarriers: {self.n_subcarriers}  |  "
             f"RSSI: {avg_rssi:.0f} dBm  |  "
             f"Rate: {hz:.1f} Hz"
         )
+
+        if self.frame_count == 0 and elapsed > 5 and not self.is_file:
+            if self.total_serial_lines == 0:
+                status += "  |  SIN DATOS - verificar baud rate"
+                self.status_text.set_color("#ff4444")
+            else:
+                status += f"  |  {self.total_serial_lines} lineas recibidas, 0 CSI - verificar firmware/WiFi"
+                self.status_text.set_color("#ffaa00")
+        elif self.frame_count > 0:
+            self.status_text.set_color("#00ff88")
+
+        self.status_text.set_text(status)
 
         return artists
 
@@ -263,10 +290,12 @@ def main():
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--port", help="Serial port for live visualization (e.g., COM3)")
     group.add_argument("--file", help="CSV file for offline visualization")
+    parser.add_argument("--baud", type=int, default=921600,
+                        help="Serial baud rate (default: 921600)")
     args = parser.parse_args()
 
     if args.port:
-        viz = CSIVisualizer(args.port, is_file=False)
+        viz = CSIVisualizer(args.port, is_file=False, baud=args.baud)
     else:
         if not Path(args.file).exists():
             print(f"ERROR: File not found: {args.file}")

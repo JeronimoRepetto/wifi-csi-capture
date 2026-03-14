@@ -22,4 +22,13 @@ menu "CSI Capture Configuration"
             Fixed channel number matching the router configuration.
             Must match the router's channel setting exactly.
 
+    config CSI_UART_BAUD
+        int "Serial baud rate for CSI output"
+        default 921600
+        range 115200 921600
+        help
+            Baud rate for UART console output. 921600 is required for
+            high-throughput CSI streaming. Must match the baud rate used
+            by the PC capture/visualize scripts.
+
 endmenu
