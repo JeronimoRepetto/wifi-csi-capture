@@ -401,7 +401,6 @@ def main():
     port_node_map = build_port_node_map(ports, args.round, manual_pos)
 
     # ── Create session directory ──────────────────────────────────────
-    sessions_root = Path(args.data_root) / "sessions"
     session_name = build_session_name(scenario, dataset_label, args.round)
     session_dir = ensure_unique_session_dir(sessions_root, session_name)
     raw_dir = session_dir / "raw"

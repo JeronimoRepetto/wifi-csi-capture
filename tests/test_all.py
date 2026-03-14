@@ -385,6 +385,21 @@ class TestRecordSessionHelpers:
         assert str(result["data_root"]).replace("\\", "/").endswith("D:/dataset")
         assert result["dataset_label"] == "stairs_walk"
 
+    def test_resolve_runtime_inputs_interactive_mode_default_data_root(self):
+        args = type("Args", (), {
+            "scenario": None,
+            "duration": None,
+            "data_root": None,
+            "dataset_label": None,
+        })()
+        # Empty answer for data root should keep the default "data".
+        answers = iter(["baseline_empty", "30s", "", "test"])
+        result = resolve_runtime_inputs(args, input_fn=lambda _: next(answers))
+        assert result["capture_mode"] == "interactive"
+        assert result["duration_s"] == 30.0
+        assert result["data_root"] == DEFAULT_DATA_ROOT
+        assert result["dataset_label"] == "test"
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 #  Tests: analyze_csi.py
