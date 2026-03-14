@@ -55,7 +55,7 @@ def load_csi_file(filepath: Path) -> dict:
                 continue
 
             parts = line.split(",")
-            if len(parts) < CSI_HEADER_FIELDS + 2:
+            if len(parts) < CSI_HEADER_FIELDS + 1:
                 continue
 
             try:
@@ -295,6 +295,66 @@ def export_baseline(data_dir: Path, output_path: Path):
     print(f"Nodes processed: {len(baseline)}")
 
 
+def spatial_analysis(baseline_dir: Path, live_dir: Path,
+                     positions_path: Path, sigma: float = 3.0,
+                     consensus: float = 0.5):
+    """
+    Run the spatial zone filter over a live session, comparing against a
+    baseline.  Prints per-node activity and overall zone score.
+    """
+    from spatial_filter import (
+        SpatialZoneFilter, build_baseline_stats,
+        load_positions, compute_zone_weights,
+    )
+
+    positions, router = load_positions(positions_path)
+    zone_weights = compute_zone_weights(positions, router)
+    baseline_stats = build_baseline_stats(baseline_dir)
+
+    filt = SpatialZoneFilter(
+        baseline_stats, zone_weights,
+        activation_sigma=sigma,
+        consensus_threshold=consensus,
+    )
+
+    session_data: dict[int, np.ndarray] = {}
+    for fpath in sorted(live_dir.rglob("*.csv")):
+        data = load_csi_file(fpath)
+        if data["n_frames"] == 0:
+            continue
+        for part in fpath.stem.split("_"):
+            if part.startswith("node"):
+                try:
+                    nid = int(part.replace("node", ""))
+                    session_data[nid] = data["amplitude"]
+                except ValueError:
+                    pass
+                break
+
+    if not session_data:
+        print("ERROR: No valid CSI data in live directory")
+        return
+
+    result = filt.analyze_session(session_data)
+
+    print(f"\n{'=' * 60}")
+    print(f"  SPATIAL ZONE ANALYSIS")
+    print(f"{'=' * 60}")
+    print(f"  Baseline nodes:    {len(baseline_stats)}")
+    print(f"  Live nodes:        {len(session_data)}")
+    print(f"  Frames analyzed:   {result['n_frames']}")
+    print(f"  Event frames:      {result['event_frames']} "
+          f"({result['event_fraction']*100:.1f}%)")
+    print(f"  Mean zone score:   {result['mean_score']:.4f}")
+    print(f"  Max zone score:    {result['max_score']:.4f}")
+
+    print(f"\n  Per-node peak activity:")
+    for nid in sorted(result["per_node_activity"].keys()):
+        peak = float(np.max(result["per_node_activity"][nid]))
+        w = zone_weights.get(nid, 0)
+        print(f"    Node {nid:>2d}  (weight {w:.2f}):  peak = {peak:.3f}")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Wi-Fi Vision 3D - CSI Data Analysis Tool"
@@ -305,6 +365,10 @@ def main():
                         help="Compare empty vs person capture directories")
     parser.add_argument("--export-baseline", default=None,
                         help="Export baseline JSON for digital twin calibration")
+    parser.add_argument("--spatial", nargs=2, metavar=("BASELINE_DIR", "LIVE_DIR"),
+                        help="Run spatial zone filter (baseline vs live)")
+    parser.add_argument("--positions", default="data/positions.json",
+                        help="Path to positions.json (for --spatial)")
     args = parser.parse_args()
 
     if args.file:
@@ -343,6 +407,12 @@ def main():
         analyze_single(empty_data)
         analyze_single(person_data)
         compare_captures(empty_data, person_data)
+
+    elif args.spatial:
+        spatial_analysis(
+            Path(args.spatial[0]), Path(args.spatial[1]),
+            Path(args.positions),
+        )
 
     else:
         parser.print_help()
