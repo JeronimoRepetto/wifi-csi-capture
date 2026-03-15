@@ -8,6 +8,14 @@ Firmware and tools for extracting Wi-Fi Channel State Information (CSI) from ESP
 
 <p align="center"><em>Real-time CSI monitor: subcarrier amplitude, phase, spectrogram, activity indicator, and RSSI</em></p>
 
+### Project overview (video, Spanish)
+
+Video created with [NotebookLM](https://notebooklm.google.com/) (in Spanish) explaining the project, how it works, and the research behind Wi-Fi Vision 3D and CSI capture.
+
+<p align="center">
+  <video src="video/Wi-Fi_Vision_3D.mp4" controls width="700" preload="metadata">Your browser does not support the video tag. <a href="video/Wi-Fi_Vision_3D.mp4">Download the video</a>.</video>
+</p>
+
 ## What is CSI?
 
 Modern Wi-Fi (802.11n/ac/ax) uses Orthogonal Frequency-Division Multiplexing (OFDM), splitting the channel into many narrow subcarriers. CSI exposes the **amplitude and phase** of each subcarrier at the physical layer. When a person moves through the RF field, their body (mostly water) reflects and absorbs microwaves, altering the multipath propagation pattern. These perturbations are encoded in the CSI matrix and can be used to detect presence, movement, and even body pose -- all without cameras.
