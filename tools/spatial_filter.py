@@ -51,6 +51,123 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from analyze_csi import load_csi_file  # noqa: E402
 
+# Maximum time difference (microseconds) between frames from different nodes
+# for them to be considered "simultaneous".  At 50 Hz, one frame period is
+# 20 000 µs; ±20 ms gives ±1 frame of tolerance.
+ALIGN_WINDOW_US = 20_000
+
+
+# ── Temporal alignment helpers ────────────────────────────────────────────
+
+def read_t0_host_us(csv_path: Path) -> int:
+    """
+    Read the ``# t0_host_us: <value>`` comment written by capture_node()
+    into the CSV header.  Returns 0 if the field is absent (legacy files).
+
+    The value is the Unix epoch in microseconds at the moment the
+    synchronization barrier released all capture threads.  Combined with
+    the per-frame ``timestamp_us`` from the ESP32 firmware, it allows
+    computing a common absolute timeline across nodes:
+
+        t_abs_us = t0_host_us + timestamp_us_firmware
+    """
+    try:
+        with open(csv_path, "r", encoding="utf-8") as f:
+            for line in f:
+                line = line.strip()
+                if not line.startswith("#"):
+                    break
+                if "t0_host_us" in line:
+                    _, _, value = line.partition(":")
+                    try:
+                        return int(value.strip())
+                    except ValueError:
+                        return 0
+    except OSError:
+        pass
+    return 0
+
+
+def align_nodes_by_timestamp(
+    node_data: dict[int, dict],
+    window_us: int = ALIGN_WINDOW_US,
+) -> dict[int, np.ndarray]:
+    """
+    Align amplitude matrices from multiple nodes onto a common time axis
+    using their absolute timestamps.
+
+    Each entry in ``node_data`` must be a dict with:
+        - ``"amplitude"`` : np.ndarray, shape (n_frames, n_subcarriers)
+        - ``"t_abs_us"``  : np.ndarray, shape (n_frames,)  — absolute
+          Unix timestamps in microseconds, computed as
+          ``t0_host_us + timestamp_us_firmware`` for each frame.
+
+    The alignment algorithm:
+    1. Use the node with the **most frames** as the reference axis.
+    2. For every reference frame t_ref, find the frame in each other node
+       whose |t_abs - t_ref| is minimised and within ``window_us``.
+    3. If no match is found within the window the frame is dropped from
+       the output (conservative).
+
+    Returns a dict mapping node_id → aligned amplitude array (same length
+    as the shortest matched sequence).
+
+    Falls back to index-based pairing (legacy behaviour) when fewer than
+    two nodes have valid absolute timestamps (t_abs_us all zeros).
+    """
+    # Decide whether we have real timestamps.
+    has_ts = {
+        nid: (d["t_abs_us"].max() > 0)
+        for nid, d in node_data.items()
+        if "t_abs_us" in d
+    }
+
+    if sum(has_ts.values()) < 2:
+        # Legacy path: index-based pairing.
+        n_frames = min(d["amplitude"].shape[0] for d in node_data.values())
+        return {nid: d["amplitude"][:n_frames] for nid, d in node_data.items()}
+
+    # Use the node with most frames as reference.
+    ref_id = max(node_data, key=lambda nid: node_data[nid]["amplitude"].shape[0])
+    ref_ts = node_data[ref_id]["t_abs_us"]
+
+    aligned: dict[int, np.ndarray] = {}
+    valid_mask = np.ones(len(ref_ts), dtype=bool)
+
+    for nid, d in node_data.items():
+        amp = d["amplitude"]
+        if nid == ref_id:
+            aligned[nid] = amp
+            continue
+
+        t_abs = d["t_abs_us"]
+        matched_rows = []
+        matched_ref_indices = []
+
+        for i, t_ref in enumerate(ref_ts):
+            diffs = np.abs(t_abs - t_ref)
+            best = int(np.argmin(diffs))
+            if diffs[best] <= window_us:
+                matched_rows.append(amp[best])
+                matched_ref_indices.append(i)
+            else:
+                valid_mask[i] = False
+
+        if not matched_rows:
+            # No overlap — fall back to empty; caller should handle.
+            aligned[nid] = np.empty((0, amp.shape[1]), dtype=amp.dtype)
+        else:
+            aligned[nid] = np.array(matched_rows)
+
+    # Trim reference to rows that had a match in ALL nodes.
+    aligned[ref_id] = aligned[ref_id][valid_mask]
+    for nid in aligned:
+        if nid != ref_id:
+            # matched_rows already excludes unmatched ref frames by construction.
+            pass
+
+    return aligned
+
 
 # ── Zone weight heuristics ────────────────────────────────────────────────
 
@@ -177,6 +294,14 @@ class SpatialZoneFilter:
         """
         Analyze an entire capture session (amplitude matrices per node).
         Returns per-frame scores and aggregate statistics.
+
+        Parameters
+        ----------
+        session_data : dict[int, np.ndarray]
+            Mapping of node_id to amplitude matrix (n_frames, n_subcarriers).
+            Pass pre-aligned arrays from :func:`align_nodes_by_timestamp` for
+            accurate multi-node temporal correlation.  Raw (unaligned) arrays
+            are accepted for single-node analysis or legacy calls.
         """
         node_ids = sorted(session_data.keys())
         n_frames = min(m.shape[0] for m in session_data.values())
@@ -281,7 +406,7 @@ def main():
     )
 
     live_dir = Path(args.live)
-    session_data: dict[int, np.ndarray] = {}
+    session_data: dict[int, dict] = {}
     for fpath in sorted(live_dir.rglob("*.csv")):
         data = load_csi_file(fpath)
         if data["n_frames"] == 0:
@@ -297,7 +422,16 @@ def main():
                 break
         if node_id is None:
             continue
-        session_data[node_id] = data["amplitude"]
+
+        # Build absolute timestamps using the t0_host_us anchor from the
+        # CSV header (written by capture_node at barrier release).
+        t0 = int(data["metadata"].get("t0_host_us", 0))
+        t_abs_us = data["timestamps"] + t0
+
+        session_data[node_id] = {
+            "amplitude": data["amplitude"],
+            "t_abs_us": t_abs_us,
+        }
 
     if not session_data:
         print("ERROR: No valid CSI data found in --live directory")
@@ -305,7 +439,10 @@ def main():
 
     print(f"Live data loaded: {len(session_data)} nodes")
 
-    result = filt.analyze_session(session_data)
+    # Align nodes temporally before analysis.
+    aligned_amps = align_nodes_by_timestamp(session_data)
+
+    result = filt.analyze_session(aligned_amps)
 
     print(f"\n{'=' * 60}")
     print(f"  SPATIAL FILTER RESULTS")

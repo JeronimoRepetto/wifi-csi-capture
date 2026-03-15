@@ -82,11 +82,29 @@ def capture_node(port: str, node_id: int, position_id: int,
                  output_dir: Path, duration: float,
                  stop_event: threading.Event,
                  scenario: str = "",
-                 baud_rate: int = BAUD_RATE) -> CaptureResult:
+                 baud_rate: int = BAUD_RATE,
+                 start_barrier: threading.Barrier | None = None,
+                 t0_box: list | None = None) -> CaptureResult:
     """
     Capture CSI data from one serial port. Returns a CaptureResult with
     statistics. This is the reusable core used by both capture_csi.py
     and record_session.py.
+
+    Parameters
+    ----------
+    start_barrier : threading.Barrier, optional
+        When provided, the thread opens the serial port and then waits at
+        the barrier until all other node threads are also ready.  This
+        minimises the start-time skew between nodes to the OS thread-
+        scheduling jitter (~1–5 ms) instead of the sequential port-open
+        latency (~50–300 ms per node).
+    t0_box : list[int], optional
+        A single-element mutable list shared across all threads.  After the
+        barrier releases, t0_box[0] contains the Unix epoch in microseconds
+        captured at the exact barrier-release instant by the barrier action.
+        Written as ``# t0_host_us: <value>`` in the CSV header so that
+        post-processing can compute an absolute timeline:
+        ``t_abs_us = t0_host_us + timestamp_us_from_firmware``.
     """
     result = CaptureResult(node_id, port)
 
@@ -96,15 +114,36 @@ def capture_node(port: str, node_id: int, position_id: int,
     filepath = output_dir / filename
     result.filepath = filepath
 
-    start_time = time.time()
-
     print(f"[Node {node_id}] Opening {port} at {baud_rate} baud...")
 
     try:
         ser = serial.Serial(port, baud_rate, timeout=1)
     except serial.SerialException as e:
         print(f"[Node {node_id}] ERROR: Cannot open {port}: {e}")
+        if start_barrier is not None:
+            try:
+                start_barrier.abort()
+            except Exception:
+                pass
         return result
+
+    # ── Synchronization barrier ──────────────────────────────────────────
+    # All threads reach this point with their serial ports open.
+    # The barrier release fires simultaneously for every thread, reducing
+    # the inter-node start skew from O(100 ms) down to O(1-5 ms).
+    if start_barrier is not None:
+        try:
+            start_barrier.wait(timeout=15)
+        except threading.BrokenBarrierError:
+            print(f"[Node {node_id}] WARNING: Sync barrier broken — "
+                  "another node failed to open its port in time. "
+                  "Continuing without full sync.")
+
+    # Read t0 from shared box AFTER the barrier so the value is the one
+    # stamped by the barrier action (fires once in the last-arriving thread).
+    t0_host_us = t0_box[0] if t0_box else 0
+
+    start_time = time.time()
 
     print(f"[Node {node_id}] Saving to: {filepath}")
 
@@ -119,6 +158,7 @@ def capture_node(port: str, node_id: int, position_id: int,
             f"# Scenario: {scenario or 'unspecified'}",
             f"# Start: {datetime.now().isoformat()}",
             f"# Duration: {duration}s",
+            f"# t0_host_us: {t0_host_us}",
         ]
         for meta_line in meta_header:
             f.write(meta_line + "\n")
@@ -182,16 +222,57 @@ def capture_node(port: str, node_id: int, position_id: int,
 
 def launch_parallel_capture(port_node_map: list[tuple[str, int, int]],
                             output_dir: Path, duration: float,
-                            scenario: str = "") -> list[CaptureResult]:
+                            scenario: str = "") -> tuple[list[CaptureResult], int]:
     """
     Launch capture threads for multiple nodes in parallel.
-    port_node_map is a list of (port, node_id, position_id) tuples.
-    Returns a list of CaptureResult objects once all threads finish.
+
+    Synchronization protocol
+    ------------------------
+    1. A ``threading.Barrier(n)`` is created before any thread is started.
+    2. Each thread opens its serial port, then waits at the barrier.
+    3. All threads are released simultaneously when the last one arrives.
+    4. ``t0_host_us`` is stamped with ``time.time_ns() // 1000`` at the
+       barrier release instant and written into every CSV header.
+
+    This reduces the inter-node start skew from ~50–300 ms (sequential
+    port-open latency) down to ~1–5 ms (OS thread-scheduling jitter).
+    The common ``t0_host_us`` anchor enables absolute timeline alignment
+    during post-processing: ``t_abs_us = t0_host_us + timestamp_us``.
+
+    Parameters
+    ----------
+    port_node_map : list of (port, node_id, position_id)
+    output_dir : Path
+    duration : float  seconds
+    scenario : str
+
+    Returns
+    -------
+    results : list[CaptureResult]
+    t0_host_us : int  – anchor timestamp (microseconds, Unix epoch)
     """
     output_dir.mkdir(parents=True, exist_ok=True)
     stop_event = threading.Event()
     results: list[CaptureResult] = []
     threads: list[threading.Thread] = []
+
+    n = len(port_node_map)
+    start_barrier = threading.Barrier(n) if n > 1 else None
+
+    # Shared mutable container so barrier-thread can write t0 back to caller.
+    t0_box: list[int] = [0]
+
+    def _on_barrier_release():
+        """Called by the last thread to reach the barrier (passes action)."""
+        t0_box[0] = time.time_ns() // 1000
+
+    if start_barrier is not None:
+        # threading.Barrier accepts an optional action callable executed
+        # once by the last-arriving thread, before all threads are released.
+        start_barrier = threading.Barrier(n, action=_on_barrier_release)
+    else:
+        # Single node: stamp t0 immediately (no barrier needed).
+        t0_box[0] = time.time_ns() // 1000
 
     for port, node_id, position_id in port_node_map:
         res = CaptureResult(node_id, port)
@@ -199,7 +280,9 @@ def launch_parallel_capture(port_node_map: list[tuple[str, int, int]],
 
         def _run(p=port, nid=node_id, pid=position_id, idx=len(results) - 1):
             results[idx] = capture_node(
-                p, nid, pid, output_dir, duration, stop_event, scenario
+                p, nid, pid, output_dir, duration, stop_event, scenario,
+                start_barrier=start_barrier,
+                t0_box=t0_box,
             )
 
         t = threading.Thread(target=_run, daemon=True)
@@ -217,7 +300,7 @@ def launch_parallel_capture(port_node_map: list[tuple[str, int, int]],
         for t in threads:
             t.join(timeout=3)
 
-    return results
+    return results, t0_box[0]
 
 
 def main():
@@ -251,12 +334,14 @@ def main():
         port_map.append((args.port2, node2_id, args.position))
 
     print("Starting capture... Press Ctrl+C to stop early.\n")
-    results = launch_parallel_capture(
+    results, t0_host_us = launch_parallel_capture(
         port_map, Path(args.output), args.duration
     )
 
     ok = sum(1 for r in results if r.success)
     print(f"\nAll captures complete. {ok}/{len(results)} nodes successful.")
+    if len(port_map) > 1:
+        print(f"  Sync anchor t0_host_us: {t0_host_us}")
 
 
 if __name__ == "__main__":

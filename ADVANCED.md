@@ -181,11 +181,67 @@ python tools/record_session.py --round 1
 ### Session manifest
 
 Each session produces a `session_manifest.json` with:
-- Timestamp, scenario, duration, round number
-- List of nodes with port, position, and output file path
-- Dataset label and operator name
-- MAC filtering results (expected vs. observed MACs)
-- Capture mode (sequential 2-node or parallel N-node)
+- `start_utc` — ISO-8601 timestamp stamped **before** the countdown, reflecting the intended capture start time (not the post-capture write time).
+- `t0_host_us` — Unix epoch in microseconds at the exact moment all capture threads were released by the synchronization barrier. Used as the anchor for absolute multi-node timeline alignment.
+- Scenario, duration, round number, dataset label, operator name.
+- List of nodes with port, position, and output file path.
+- MAC filtering results (expected vs. observed MACs).
+- Capture mode (sequential 2-node or parallel N-node).
+
+---
+
+## Inter-Node Temporal Synchronization
+
+### The problem
+
+Each ESP32-S3 timestamps CSI frames with `esp_timer_get_time()` — a free-running counter that resets to zero on every boot and has no relationship to any other node's counter. Without synchronization:
+
+- **Start-time skew**: nodes open their serial ports sequentially on the host, so the first node begins recording ~50–300 ms before the last one.
+- **Clock drift**: the ESP32 internal oscillator drifts ~50–200 ppm relative to real time. Over a 5-minute session, two nodes can diverge by ~30–60 ms (~1.5–3 frames at 50 Hz).
+- **Index mismatch**: frame `f` from node A and frame `f` from node B may represent RF snapshots taken seconds apart.
+
+### The solution: Barrier + anchor timestamp
+
+`capture_csi.py` implements a two-part software synchronization protocol:
+
+**1. `threading.Barrier(n)` — start alignment**
+
+Each capture thread opens its serial port, then waits at a barrier. All threads are released simultaneously when the last one arrives. This reduces the inter-node start skew from ~50–300 ms down to ~1–5 ms (OS thread-scheduling jitter).
+
+**2. `t0_host_us` — absolute anchor**
+
+At the exact barrier-release instant, the host stamps `t0_host_us = time.time_ns() // 1000` (Unix epoch in microseconds). This value is:
+- Written in every CSV header: `# t0_host_us: <value>`
+- Stored in `session_manifest.json` for session-level traceability.
+
+**3. Absolute timeline reconstruction**
+
+For post-processing, each frame's absolute timestamp is:
+
+```python
+t_abs_us = t0_host_us + timestamp_us_firmware
+```
+
+This converts the per-node relative counter into a common absolute timeline that can be compared across nodes.
+
+**4. Temporal join in `spatial_filter.py`**
+
+`align_nodes_by_timestamp()` uses the absolute timestamps to perform a nearest-neighbor join across nodes with a ±20 ms tolerance window (configurable via `ALIGN_WINDOW_US`). Frames without a match in any node are discarded. This replaces the previous index-based pairing.
+
+### Expected accuracy
+
+| Error source | Magnitude | Impact |
+|---|---|---|
+| Thread barrier jitter (OS scheduling) | ~1–5 ms | ~0.05–0.25 frames at 50 Hz |
+| Serial port open latency (eliminated by barrier) | 50–300 ms | Eliminated |
+| ESP32 oscillator drift | 50–200 ppm | ~1.5–6 ms/min → ~7–30 ms over 5 min |
+| Total worst-case at 5 min | ~35 ms | ~1.75 frames at 50 Hz |
+
+For **activity classification** (P0/P1), this error budget is acceptable. For **3D pose estimation** (P2) requiring sub-frame alignment, hardware-level synchronization would be needed (e.g., a shared GPIO trigger or dedicated NTP server on the local Wi-Fi network).
+
+### Legacy compatibility
+
+CSVs captured before this change lack the `# t0_host_us` header. `align_nodes_by_timestamp()` detects this and falls back to index-based pairing automatically, so old data is not broken.
 
 ## Troubleshooting
 

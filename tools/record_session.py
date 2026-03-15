@@ -362,9 +362,17 @@ def write_manifest(session_dir: Path, scenario: str, duration: float,
                    data_root_resolved: str = "",
                    operator: str = "",
                    expected_mac: str = "",
-                   mac_summary: dict | None = None):
+                   mac_summary: dict | None = None,
+                   start_utc: str = "",
+                   t0_host_us: int = 0):
     """
     Write session_manifest.json with full traceability metadata.
+
+    start_utc is stamped BEFORE the capture countdown so it reflects the
+    intended capture start time.  t0_host_us is the Unix epoch in
+    microseconds at the exact moment all node threads were released by the
+    synchronization barrier — this is the anchor for absolute timeline
+    alignment across nodes.
     """
     manifest = {
         "session_id": session_dir.name,
@@ -373,7 +381,8 @@ def write_manifest(session_dir: Path, scenario: str, duration: float,
         "capture_mode": capture_mode,
         "round": round_id,
         "duration_requested_s": duration,
-        "start_utc": datetime.now(tz=timezone.utc).isoformat(),
+        "start_utc": start_utc or datetime.now(tz=timezone.utc).isoformat(),
+        "t0_host_us": t0_host_us,
         "data_root_resolved": data_root_resolved,
         "operator": operator,
         "expected_mac": expected_mac,
@@ -528,6 +537,10 @@ def main():
     print()
 
     # ── Countdown ─────────────────────────────────────────────────────
+    # Stamp start_utc BEFORE the countdown so the manifest reflects the
+    # actual intended capture start time, not the post-capture write time.
+    start_utc = datetime.now(tz=timezone.utc).isoformat()
+
     print("Starting in 3 seconds... (Ctrl+C to abort)")
     for i in range(3, 0, -1):
         print(f"  {i}...")
@@ -535,7 +548,7 @@ def main():
     print()
 
     # ── Capture ───────────────────────────────────────────────────────
-    results = launch_parallel_capture(
+    results, t0_host_us = launch_parallel_capture(
         port_node_map, raw_dir, duration_s, scenario=scenario
     )
 
@@ -563,6 +576,8 @@ def main():
         operator=args.operator,
         expected_mac=expected_mac or "",
         mac_summary=mac_summary,
+        start_utc=start_utc,
+        t0_host_us=t0_host_us,
     )
 
     # ── Final summary ─────────────────────────────────────────────────
