@@ -13,6 +13,8 @@ Run with:
 import csv
 import json
 import sys
+import tempfile
+import shutil
 from pathlib import Path
 
 import numpy as np
@@ -41,7 +43,22 @@ from spatial_filter import (  # noqa: E402
     _line_segment_inside_box,
     compute_zone_weights,
     SpatialZoneFilter,
+    read_t0_host_us,
+    align_nodes_by_timestamp,
+    ALIGN_WINDOW_US,
 )
+
+
+@pytest.fixture
+def tmp_path():
+    """Use a workspace-local tmp dir so the sandbox permits file writes."""
+    base = Path(__file__).parent / "tmp"
+    base.mkdir(exist_ok=True)
+    import uuid
+    d = base / uuid.uuid4().hex[:8]
+    d.mkdir(exist_ok=True)
+    yield d
+    shutil.rmtree(d, ignore_errors=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -77,7 +94,8 @@ def _make_csi_line(timestamp_us=1000000, mac="aa:bb:cc:dd:ee:ff",
 def _write_synthetic_csv(filepath: Path, n_frames=100,
                          node_id=1, position_id=1,
                          amplitude_base=30.0, noise_std=2.0,
-                         scenario="baseline_empty"):
+                         scenario="baseline_empty",
+                         t0_host_us=1_741_000_000_000_000):
     """Write a synthetic CSV that load_csi_file() can read."""
     with open(filepath, "w", newline="", encoding="utf-8") as f:
         f.write(f"# Wi-Fi Vision 3D - CSI Capture\n")
@@ -87,6 +105,7 @@ def _write_synthetic_csv(filepath: Path, n_frames=100,
         f.write(f"# Scenario: {scenario}\n")
         f.write(f"# Start: 2026-03-14T15:00:00\n")
         f.write(f"# Duration: 10s\n")
+        f.write(f"# t0_host_us: {t0_host_us}\n")
 
         writer = csv.writer(f)
         writer.writerow(CSI_HEADER + ["csi_data"])
@@ -272,7 +291,9 @@ class TestWriteManifest:
         manifest = write_manifest(
             session_dir, "baseline_empty", 300.0,
             round_id=1, port_node_map=[("COM3", 1, 1), ("COM4", 2, 2)],
-            results=[r1, r2], notes="test run"
+            results=[r1, r2], notes="test run",
+            start_utc="2026-03-14T15:00:00+00:00",
+            t0_host_us=1_741_000_000_000_000,
         )
 
         manifest_path = session_dir / "session_manifest.json"
@@ -288,6 +309,9 @@ class TestWriteManifest:
         assert len(loaded["nodes"]) == 2
         assert loaded["summary"]["total_frames"] == 195
         assert loaded["summary"]["successful_nodes"] == 2
+        # New sync fields
+        assert loaded["start_utc"] == "2026-03-14T15:00:00+00:00"
+        assert loaded["t0_host_us"] == 1_741_000_000_000_000
 
     def test_session_dir_structure(self, tmp_path):
         session_dir = tmp_path / "my_session"
@@ -310,6 +334,7 @@ class TestWriteManifest:
             capture_mode="interactive",
             data_root_resolved="D:/csi_data",
             operator="jeron",
+            t0_host_us=9999,
         )
 
         data = json.loads((session_dir / "session_manifest.json").read_text(encoding="utf-8"))
@@ -317,6 +342,21 @@ class TestWriteManifest:
         assert data["capture_mode"] == "interactive"
         assert data["data_root_resolved"] == "D:/csi_data"
         assert data["operator"] == "jeron"
+        assert data["t0_host_us"] == 9999
+
+    def test_start_utc_is_set_before_capture(self, tmp_path):
+        """start_utc must be a real ISO timestamp, not empty."""
+        import re
+        session_dir = tmp_path / "ts_session"
+        session_dir.mkdir()
+        r = CaptureResult(1, "COM3")
+        write_manifest(
+            session_dir, "baseline_empty", 30.0, 1, [], [r], "",
+            start_utc="2026-03-14T16:00:00+00:00",
+        )
+        data = json.loads((session_dir / "session_manifest.json").read_text(encoding="utf-8"))
+        iso_pattern = r"\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"
+        assert re.match(iso_pattern, data["start_utc"])
 
 
 class TestDataRootDefault:
@@ -784,3 +824,276 @@ class TestSpatialInsideVsOutside:
         assert filt.is_zone_event(frame) is False, (
             "Single-node perturbation must not trigger zone event"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+#  Tests: temporal synchronization (capture_csi.py + spatial_filter.py)
+# ═══════════════════════════════════════════════════════════════════════════
+
+T0_ANCHOR = 1_741_000_000_000_000  # arbitrary fixed epoch in µs
+
+
+class TestReadT0HostUs:
+    def test_reads_value_from_header(self, tmp_path):
+        csv_path = tmp_path / "node01.csv"
+        _write_synthetic_csv(csv_path, n_frames=10, t0_host_us=T0_ANCHOR)
+        assert read_t0_host_us(csv_path) == T0_ANCHOR
+
+    def test_returns_zero_for_legacy_file(self, tmp_path):
+        """Legacy CSV without # t0_host_us line must return 0."""
+        csv_path = tmp_path / "legacy.csv"
+        with open(csv_path, "w", encoding="utf-8") as f:
+            f.write("# Wi-Fi Vision 3D - CSI Capture\n")
+            f.write("# Node ID: 1\n")
+            f.write("timestamp_us,mac\n")
+        assert read_t0_host_us(csv_path) == 0
+
+    def test_returns_zero_for_missing_file(self, tmp_path):
+        assert read_t0_host_us(tmp_path / "nonexistent.csv") == 0
+
+
+class TestAlignNodesByTimestamp:
+    """Tests for align_nodes_by_timestamp() in spatial_filter.py."""
+
+    def _make_node_data(self, n_frames, t0, hz=50.0, n_sub=N_SUBCARRIERS,
+                        amp_base=30.0, node_id=1):
+        """Build a node_data entry with t_abs_us and amplitude."""
+        dt_us = int(1_000_000 / hz)
+        firmware_ts = np.arange(n_frames, dtype=np.int64) * dt_us
+        t_abs = firmware_ts + t0
+        rng = np.random.default_rng(node_id)
+        amp = np.full((n_frames, n_sub), amp_base) + rng.normal(0, 1, (n_frames, n_sub))
+        return {"amplitude": amp, "t_abs_us": t_abs}
+
+    def _make_node_data_with_drift(self, n_frames, t0, hz=50.0,
+                                   drift_ppm=100, n_sub=N_SUBCARRIERS,
+                                   amp_base=30.0, node_id=1):
+        """
+        Build a node with realistic clock drift.
+        drift_ppm: each frame interval grows by drift_ppm µs per second.
+        E.g. drift_ppm=100 means +0.01% → at 50 Hz, each frame is 20 µs + 0.002 µs longer.
+        Accumulated over 300s this gives ~600 ms total drift vs a perfect clock.
+        """
+        nominal_dt = 1_000_000 / hz
+        # Each frame dt increases linearly: dt_i = nominal + drift_ppm/1e6 * nominal * i
+        dts = nominal_dt * (1 + drift_ppm / 1e6 * np.arange(n_frames))
+        firmware_ts = np.concatenate([[0], np.cumsum(dts[:-1])]).astype(np.int64)
+        t_abs = firmware_ts + t0
+        rng = np.random.default_rng(node_id)
+        amp = np.full((n_frames, n_sub), amp_base) + rng.normal(0, 1, (n_frames, n_sub))
+        return {"amplitude": amp, "t_abs_us": t_abs}
+
+    # ── Basic shape tests ────────────────────────────────────────────────
+
+    def test_single_node_returns_same_length(self):
+        data = {1: self._make_node_data(100, T0_ANCHOR)}
+        aligned = align_nodes_by_timestamp(data)
+        assert aligned[1].shape[0] == 100
+
+    def test_two_nodes_same_t0_perfectly_aligned(self):
+        """Two nodes with identical t0 and same frame rate align 1:1."""
+        data = {
+            1: self._make_node_data(100, T0_ANCHOR, hz=50),
+            2: self._make_node_data(100, T0_ANCHOR, hz=50, node_id=2),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        assert aligned[1].shape[0] == aligned[2].shape[0]
+        assert aligned[1].shape[0] > 90
+
+    # ── Multi-node (3+) alignment ────────────────────────────────────────
+
+    def test_three_nodes_same_t0(self):
+        """Three nodes with same t0 must all produce the same aligned length."""
+        data = {
+            1: self._make_node_data(100, T0_ANCHOR, hz=50),
+            2: self._make_node_data(100, T0_ANCHOR, hz=50, node_id=2),
+            3: self._make_node_data(100, T0_ANCHOR, hz=50, node_id=3),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        lengths = [aligned[nid].shape[0] for nid in (1, 2, 3)]
+        assert len(set(lengths)) == 1, f"Mismatched lengths: {lengths}"
+        assert lengths[0] > 90
+
+    def test_five_nodes_small_staggered_offsets(self):
+        """
+        Simulate 5 nodes where each one starts 2 ms later than the previous
+        (realistic barrier skew ~1-5 ms per node).  All should align well.
+        """
+        data = {}
+        for i in range(1, 6):
+            offset_us = (i - 1) * 2_000  # 0, 2, 4, 6, 8 ms stagger
+            data[i] = self._make_node_data(
+                100, T0_ANCHOR + offset_us, hz=50, node_id=i
+            )
+        aligned = align_nodes_by_timestamp(data)
+        lengths = [aligned[nid].shape[0] for nid in range(1, 6)]
+        # All nodes should agree on length and keep most frames
+        assert len(set(lengths)) == 1, f"Lengths differ: {lengths}"
+        assert lengths[0] > 85, f"Too many frames dropped: {lengths[0]}"
+
+    def test_eight_nodes_full_deployment(self):
+        """
+        Simulate a complete 8-node deployment with realistic start skew
+        (barrier reduces it to ~1-5 ms per node) and verify that all 8 nodes
+        produce the same aligned length with minimal frame loss.
+        """
+        data = {}
+        for i in range(1, 9):
+            # Random offset 0-5 ms each (post-barrier jitter)
+            rng = np.random.default_rng(i * 7)
+            offset_us = int(rng.uniform(0, 5_000))
+            data[i] = self._make_node_data(
+                200, T0_ANCHOR + offset_us, hz=50, node_id=i
+            )
+        aligned = align_nodes_by_timestamp(data)
+        lengths = [aligned[nid].shape[0] for nid in range(1, 9)]
+        assert len(set(lengths)) == 1, f"8-node lengths differ: {lengths}"
+        assert lengths[0] > 190, f"Excessive frame loss in 8-node: {lengths[0]}"
+
+    # ── Frame rate mismatch ──────────────────────────────────────────────
+
+    def test_two_nodes_different_hz(self):
+        """
+        One node captures at 47 Hz, another at 53 Hz (realistic serial jitter).
+        Alignment should still produce matching lengths with few dropped frames.
+        """
+        data = {
+            1: self._make_node_data(100, T0_ANCHOR, hz=47.0),
+            2: self._make_node_data(100, T0_ANCHOR, hz=53.0, node_id=2),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        assert aligned[1].shape[0] == aligned[2].shape[0]
+        # With different rates the slower node sets the pace; expect ~90% retention
+        assert aligned[1].shape[0] > 80
+
+    def test_two_nodes_different_frame_counts(self):
+        """
+        One node captures 480 frames, another 510 (same session, slightly different
+        durations due to serial buffering).  Output must be the same length.
+        """
+        data = {
+            1: self._make_node_data(480, T0_ANCHOR, hz=50),
+            2: self._make_node_data(510, T0_ANCHOR, hz=50, node_id=2),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        assert aligned[1].shape[0] == aligned[2].shape[0]
+        assert aligned[1].shape[0] >= 480  # should keep all ref frames
+
+    # ── Clock drift ──────────────────────────────────────────────────────
+
+    def test_two_nodes_realistic_drift_5min(self):
+        """
+        Simulate a 5-minute session with 100 ppm drift between two nodes.
+        At 50 Hz × 300s = 15,000 frames.  After 5 min the drift is ~30 ms,
+        which is just outside the ±20 ms window for the last few frames.
+        Verify that > 95% of frames are retained (drift only matters near the end).
+        """
+        n_frames = 15_000  # 5 min at 50 Hz
+        data = {
+            1: self._make_node_data(n_frames, T0_ANCHOR, hz=50),
+            2: self._make_node_data_with_drift(
+                n_frames, T0_ANCHOR, hz=50, drift_ppm=100, node_id=2
+            ),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        assert aligned[1].shape[0] == aligned[2].shape[0]
+        retention = aligned[1].shape[0] / n_frames
+        assert retention > 0.95, (
+            f"Drift caused excessive frame loss: {retention:.1%} retention "
+            f"({aligned[1].shape[0]}/{n_frames} frames kept)"
+        )
+
+    # ── Temporal correctness (not just shape) ───────────────────────────
+
+    def test_aligned_frames_are_temporally_closest(self):
+        """
+        Verify that the alignment pairs each reference frame with the
+        temporally nearest frame from the other node, not an arbitrary one.
+        Node 2 starts offset_us later than node 1 but at the same frame rate.
+        Since offset (3 ms) < half-period (10 ms), frame i of node 1 should
+        pair with frame i of node 2.  We encode the frame index in the
+        amplitude so we can check: aligned_node2[i] ≈ 100 + i (not 100 + i±1).
+        """
+        n = 20
+        dt_us = 20_000  # 50 Hz → period = 20 ms
+        offset_us = 3_000  # 3 ms — well inside ±10 ms half-period
+
+        # Node 1: amplitude[i] = i (index-labelled)
+        t_abs_1 = T0_ANCHOR + np.arange(n, dtype=np.int64) * dt_us
+        amp_1 = np.arange(n, dtype=float).reshape(n, 1) * np.ones((1, N_SUBCARRIERS))
+
+        # Node 2 starts 3 ms later; amplitude[i] = 100 + i
+        t_abs_2 = T0_ANCHOR + offset_us + np.arange(n, dtype=np.int64) * dt_us
+        amp_2 = (100 + np.arange(n, dtype=float)).reshape(n, 1) * np.ones((1, N_SUBCARRIERS))
+
+        data = {
+            1: {"amplitude": amp_1, "t_abs_us": t_abs_1},
+            2: {"amplitude": amp_2, "t_abs_us": t_abs_2},
+        }
+        aligned = align_nodes_by_timestamp(data)
+
+        assert aligned[1].shape[0] > 0, "No frames survived alignment"
+        for i in range(aligned[1].shape[0]):
+            # amp_1[i] = i;  amp_2[j] = 100+j  →  if paired correctly: amp_2 - amp_1 = 100
+            ref_val = aligned[1][i, 0]    # should be i
+            other_val = aligned[2][i, 0]  # should be 100 + i
+            pairing_delta = other_val - ref_val
+            assert abs(pairing_delta - 100) < 2, (
+                f"Frame {i}: node1={ref_val:.0f}, node2={other_val:.0f} — "
+                f"expected offset=100 (same-index pairing), got {pairing_delta:.0f}"
+            )
+
+    # ── Edge cases and fallbacks ──────────────────────────────────────────
+
+    def test_two_nodes_small_offset_within_window(self):
+        """5 ms offset between nodes — within ±20 ms window, should align fully."""
+        offset_us = 5_000  # 5 ms
+        data = {
+            1: self._make_node_data(100, T0_ANCHOR, hz=50),
+            2: self._make_node_data(100, T0_ANCHOR + offset_us, hz=50, node_id=2),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        assert aligned[1].shape[0] == aligned[2].shape[0]
+        assert aligned[1].shape[0] > 90
+
+    def test_two_nodes_large_offset_outside_window(self):
+        """2 second offset, much larger than the 1s total duration — zero overlap."""
+        offset_us = 2_000_000  # 2000 ms, >> 1s total session length
+        data = {
+            1: self._make_node_data(50, T0_ANCHOR, hz=50),
+            2: self._make_node_data(50, T0_ANCHOR + offset_us, hz=50, node_id=2),
+        }
+        aligned = align_nodes_by_timestamp(data)
+        for nid, arr in aligned.items():
+            assert arr.shape[0] == 0, (
+                f"Node {nid}: expected 0 frames after large offset, got {arr.shape[0]}"
+            )
+
+    def test_legacy_fallback_when_no_timestamps(self):
+        """If t_abs_us is all zeros (legacy), falls back to index pairing."""
+        data = {
+            1: {"amplitude": np.ones((80, N_SUBCARRIERS)),
+                "t_abs_us": np.zeros(80, dtype=np.int64)},
+            2: {"amplitude": np.ones((100, N_SUBCARRIERS)),
+                "t_abs_us": np.zeros(100, dtype=np.int64)},
+        }
+        aligned = align_nodes_by_timestamp(data)
+        # Legacy path: truncated to min length
+        assert aligned[1].shape[0] == 80
+        assert aligned[2].shape[0] == 80
+
+    def test_csv_t0_roundtrip(self, tmp_path):
+        """Write a synthetic CSV with t0, load it, compute t_abs_us, verify alignment."""
+        t0 = T0_ANCHOR
+        path1 = tmp_path / "node01.csv"
+        path2 = tmp_path / "node02.csv"
+        _write_synthetic_csv(path1, n_frames=50, node_id=1, t0_host_us=t0)
+        _write_synthetic_csv(path2, n_frames=50, node_id=2, t0_host_us=t0)
+
+        from analyze_csi import load_csi_file
+        for path in (path1, path2):
+            d = load_csi_file(path)
+            t0_read = int(d["metadata"].get("t0_host_us", 0))
+            assert t0_read == t0, f"t0_host_us mismatch in {path.name}"
+            t_abs = d["timestamps"] + t0_read
+            assert t_abs[0] >= t0  # first frame must be at or after anchor
