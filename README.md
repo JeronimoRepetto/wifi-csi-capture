@@ -12,9 +12,7 @@ Firmware and tools for extracting Wi-Fi Channel State Information (CSI) from ESP
 
 Video created with [NotebookLM](https://notebooklm.google.com/) (in Spanish) explaining the project, how it works, and the research behind Wi-Fi Vision 3D and CSI capture.
 
-<p align="center">
-  <video src="video/Wi-Fi_Vision_3D.mp4" controls width="700" preload="metadata">Your browser does not support the video tag. <a href="video/Wi-Fi_Vision_3D.mp4">Download the video</a>.</video>
-</p>
+**[Watch / download video](video/Wi-Fi_Vision_3D.mp4)** *(requires the file in this repo)*
 
 ## What is CSI?
 
